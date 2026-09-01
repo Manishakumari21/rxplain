@@ -22,24 +22,25 @@ pub struct RustcMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct DiagnosticChild {
-    pub level: String,
     pub message: String,
     pub spans: Vec<Span>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Span {
-    pub is_primary: bool,
     pub file_name: String,
     pub line_start: u32,
+    pub line_end: u32,
     pub column_start: u32,
+    pub column_end: u32,
+    pub label: Option<String>,
     pub text: Vec<SpanText>,
 
     pub suggested_replacement: Option<String>,
     pub suggestion_applicability: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SpanText {
     pub text: String,
 }
@@ -48,13 +49,19 @@ pub struct SpanText {
 pub struct ParsedError {
     pub code: String,
     pub raw_message: String,
-    pub file: String,
-    pub primary_line: u32,
-    pub primary_snippet: String,
+    pub spans: Vec<Span>,
+    pub suggestions: Vec<CompilerSuggestion>,
+}
 
-    // Information provided by rustc for safe automatic fixes
-    pub suggested_replacement: Option<String>,
-    pub suggestion_applicability: Option<String>,
+#[derive(Debug, Clone)]
+pub struct CompilerSuggestion {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub column_end: u32,
+    pub replacement: String,
+    pub applicability: String,
+    pub label: Option<String>,
 }
 
 impl ParsedError {
@@ -65,31 +72,35 @@ impl ParsedError {
 
         let code = msg.code.as_ref()?.code.clone();
 
-        let primary = msg.spans.iter().find(|s| s.is_primary)?;
+        let mut spans = msg.spans.clone();
+        let mut suggestions = Vec::new();
 
-        // Look for a compiler-provided safe suggestion.
-        let suggestion = msg
-            .children
-            .iter()
-            .flat_map(|child| child.spans.iter())
-            .find(|span| span.suggested_replacement.is_some());
+        for child in &msg.children {
+            for span in &child.spans {
+                if let Some(replacement) = &span.suggested_replacement {
+                    suggestions.push(CompilerSuggestion {
+                        file: span.file_name.clone(),
+                        line: span.line_start,
+                        column: span.column_start,
+                        column_end: span.column_end,
+                        replacement: replacement.clone(),
+                        applicability: span
+                            .suggestion_applicability
+                            .clone()
+                            .unwrap_or_else(|| "Unknown".to_string()),
+                        label: Some(child.message.clone()),
+                    });
+                }
+            }
+        }
 
-        Some(ParsedError {
+        spans.sort_by_key(|span| (span.line_start, span.column_start));
+
+        Some(Self {
             code,
             raw_message: msg.message.clone(),
-            file: primary.file_name.clone(),
-            primary_line: primary.line_start,
-            primary_snippet: primary
-                .text
-                .first()
-                .map(|t| t.text.trim().to_string())
-                .unwrap_or_default(),
-
-            suggested_replacement: suggestion
-                .and_then(|s| s.suggested_replacement.clone()),
-
-            suggestion_applicability: suggestion
-                .and_then(|s| s.suggestion_applicability.clone()),
+            spans,
+            suggestions,
         })
     }
 }

@@ -1,0 +1,6 @@
+[package]
+name = "e0596_case"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

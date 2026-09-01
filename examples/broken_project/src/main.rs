@@ -1,7 +1,5 @@
 fn main() {
-    let name = String::from("manisha");
+    let number: i32 = "hello";
 
-    let other = name;
-
-    println!("{}",name);
+    println!("{}", number);
 }

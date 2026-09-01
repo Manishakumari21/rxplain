@@ -1,924 +1,346 @@
 # rxplain
 
-**A deterministic Rust compiler diagnostic analyzer that explains errors using the compiler's own structured diagnostics and provides safe fixes when the compiler can prove them.**
+**A deterministic, offline Rust compiler error explainer with safe auto-fixes.**
 
-## Why this exists
+`rxplain` reads Rust's structured compiler diagnostics, explains what went wrong using the actual source context, and applies fixes only when `rustc` marks them `MachineApplicable`.
 
-Rust's compiler is extremely powerful, but compiler diagnostics can still be difficult to understand, especially for developers learning ownership, borrowing, lifetimes, and type systems.
+## ✨ Features
 
-Rust already provides detailed diagnostic information through:
+* Context-aware Rust compiler error explanations
+* Source locations, spans, and related diagnostics
+* Compiler-provided suggestions
+* Safe `--fix` for `MachineApplicable` suggestions
+* Automatic build verification after fixes
+* `--walk` step-by-step tutorial mode for ownership and borrow errors
+* `--tui` interactive terminal browser (ratatui)
+* JSON output for tools and integrations
+* Works offline — no AI API or API key required
+
+## 🔧 How it works
 
 ```text
+Rust project
+     ↓
 cargo check --message-format=json
+     ↓
+Parse diagnostics
+     ↓
+Analyze source context
+     ↓
+Explain error
+     ↓
+Evaluate compiler suggestion
+     ↓
+Optional safe fix
+     ↓
+Verify build
 ```
 
-This includes:
+## 🚀 Install
 
-* error codes
-* error messages
-* source files
-* line and column information
-* primary and secondary spans
-* labels
-* compiler suggestions
-* suggested replacements
-* suggestion applicability
-* compiler explanations
+Requires Rust and Cargo.
 
-`rxplain` uses this information to build a developer-friendly layer on top of the Rust compiler.
+Via `cargo install`:
 
-The goal is **not to replace the compiler** and not to maintain a huge database of hardcoded fixes.
-
-Instead, `rxplain` reads what the compiler already knows about the user's actual code and presents it in a simpler format.
-
----
-
-## The problem with hardcoded fixes
-
-A simple implementation could do this:
-
-```text
-if error == E0382:
-    suggest .clone()
+```bash
+cargo install --path .
 ```
 
-This is not reliable enough for a real developer tool.
+Or with the bundled installer script (builds the release binary):
 
-The same compiler error can occur in many different situations, and the correct solution depends on the actual code and the developer's intention.
-
-For example, a moved value might be fixed by:
-
-* borrowing the value
-* cloning the value
-* changing ownership
-* changing a function signature
-* restructuring the code
-* using `Copy`
-* changing the lifetime or scope
-
-Therefore, `rxplain` does **not** assume that every occurrence of an error has the same solution.
-
----
-
-# Core design principle
-
-`rxplain` follows this rule:
-
-> **Use the Rust compiler as the source of truth.**
-
-The compiler produces structured diagnostic information.
-
-`rxplain` consumes that information and turns it into a simpler developer experience.
-
-```text
-                 Rust Project
-                      │
-                      ▼
-              Cargo / rustc
-                      │
-                      ▼
-       Structured JSON diagnostics
-                      │
-                      ▼
-                diagnostics.rs
-                      │
-                      ▼
-              Parsed diagnostics
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-   Explanation engine        Fix analyzer
-          │                       │
-          ▼                       ▼
-   Human-readable          Compiler-provided
-      explanation               suggestion
-          │                       │
-          └───────────┬───────────┘
-                      ▼
-                  CLI output
+```bash
+./scripts/install.sh                # to ~/.cargo/bin
+./scripts/install.sh ~/.local/bin   # to a custom directory
 ```
 
----
+Then:
 
-# Project structure
-
-```text
-rxplain/
-│
-├── Cargo.toml
-├── Cargo.lock
-├── README.md
-│
-├── src/
-│   ├── main.rs
-│   ├── runner.rs
-│   ├── diagnostics.rs
-│   ├── explain.rs
-│   └── fixer.rs
-│
-└── examples/
-    └── broken_project/
-        ├── Cargo.toml
-        └── src/
-            └── main.rs
+```bash
+rxplain --version
 ```
 
----
+## ▶️ Usage
 
-# Module responsibilities
-
-## `src/main.rs`
-
-CLI entry point.
-
-Responsible for:
-
-* reading command-line arguments
-* selecting the target project
-* running the diagnostic pipeline
-* displaying results
-* handling `--fix`
-
-It should **not** contain compiler-analysis logic.
-
----
-
-## `src/runner.rs`
-
-Responsible for executing Cargo.
-
-Example:
-
-```text
-cargo check --message-format=json
-```
-
-or:
-
-```text
-cargo build --message-format=json
-```
-
-It captures the JSON output and passes compiler messages to the diagnostic parser.
-
-The runner does not decide what an error means.
-
----
-
-## `src/diagnostics.rs`
-
-Responsible for converting Rust's JSON diagnostic format into internal Rust structures.
-
-It extracts information such as:
-
-```text
-error code
-message
-file
-line
-column
-source snippet
-primary span
-secondary spans
-labels
-suggested replacement
-suggestion applicability
-child diagnostics
-```
-
-The important point is that `ParsedError` represents the **actual compiler diagnostic**, rather than a predefined error situation.
-
----
-
-## `src/explain.rs`
-
-Responsible for presenting compiler diagnostics in simple language.
-
-The explanation engine should use information from the actual diagnostic.
-
-For example:
-
-```text
-Error: E0382
-
-File: src/main.rs
-Line: 6
-
-The value `name` was moved earlier and is being used again here.
-
-The compiler suggests:
-    name.clone()
-```
-
-The system may have small explanations for common Rust concepts, but these should support the compiler diagnostic rather than replace it.
-
----
-
-## `src/fixer.rs`
-
-Responsible for determining whether a compiler suggestion can safely be applied.
-
-The fixer should primarily use:
-
-```text
-suggested_replacement
-```
-
-and:
-
-```text
-suggestion_applicability
-```
-
-provided by rustc.
-
-For example:
-
-```text
-MachineApplicable
-```
-
-means the compiler considers the suggested change mechanically applicable.
-
-Other applicability levels should not automatically modify the user's code.
-
-The fixer should never blindly assume:
-
-```text
-E0382 = clone()
-```
-
-Instead:
-
-```text
-E0382
-   ↓
-Does rustc provide a suggestion?
-   ↓
-Is it MachineApplicable?
-   ↓
-Apply compiler suggestion
-```
-
-If no safe suggestion exists:
-
-```text
-Do not modify the source.
-Explain the problem instead.
-```
-
----
-
-# How rxplain works
-
-Suppose a user has:
-
-```rust
-fn main() {
-    let name = String::from("manisha");
-
-    let other = name;
-
-    println!("{}", name);
-}
-```
-
-The user runs:
+Analyze a project:
 
 ```bash
 rxplain .
 ```
 
-`rxplain` executes:
+Analyze another project:
 
 ```bash
-cargo check --message-format=json
+rxplain /path/to/project
 ```
 
-Rust produces a diagnostic containing information similar to:
-
-```text
-error: E0382
-
-message:
-borrow of moved value: `name`
-
-primary span:
-src/main.rs:6
-
-compiler suggestion:
-name.clone()
-
-applicability:
-MachineApplicable
-```
-
-`rxplain` converts this into:
-
-```text
-E0382 — Use of a moved value
-
-Location:
-src/main.rs:6
-
-What happened:
-`name` was moved to `other`, so the original value
-cannot be used again.
-
-Compiler suggestion:
-name.clone()
-
-This suggestion is safe to apply automatically.
-```
-
-If the compiler provides no safe suggestion, `rxplain` does not invent one.
-
----
-
-# Dynamic error handling
-
-`rxplain` should support errors dynamically rather than maintaining a hardcoded solution for every possible Rust error.
-
-For example:
-
-```text
-E0382
-E0502
-E0499
-E0597
-E0308
-E0505
-E0596
-E0106
-...
-```
-
-The compiler itself remains the primary source of information.
-
-This means that an unsupported error code can still produce useful output.
-
-Example:
-
-```text
-Unknown compiler error: E0277
-
-Message:
-the trait bound `X: Y` is not satisfied
-
-Location:
-src/main.rs:15
-
-Compiler diagnostic:
-...
-
-Compiler suggestion:
-...
-```
-
-`rxplain` does not need a custom hardcoded implementation for every Rust error before it can be useful.
-
----
-
-# Explanation strategy
-
-The explanation system has two layers.
-
-## Layer 1 — Compiler diagnostic
-
-Always use the actual diagnostic information:
-
-```text
-error code
-message
-location
-spans
-labels
-suggestions
-```
-
-This makes the output specific to the user's code.
-
-## Layer 2 — Concept explanation
-
-For common errors, `rxplain` can add a short educational explanation.
-
-For example:
-
-```text
-E0382
-
-Rust ownership:
-A value that does not implement Copy is moved when ownership
-is transferred to another variable or function.
-
-In your code:
-`name` was moved here:
-    let other = name;
-
-Then it was used here:
-    println!("{}", name);
-```
-
-This is much better than simply returning:
-
-```text
-E0382 = use clone()
-```
-
----
-
-# Auto-fix policy
-
-`rxplain` follows a conservative auto-fix policy.
-
-### Safe
-
-A fix may be automatically applied when:
-
-```text
-rustc provides a suggested replacement
-AND
-suggestion applicability == MachineApplicable
-```
-
-### Not automatically fixed
-
-If the compiler says the suggestion is:
-
-```text
-MaybeIncorrect
-```
-
-or:
-
-```text
-HasPlaceholders
-```
-
-or no suggestion exists,
-
-`rxplain` should not automatically modify the source.
-
-Instead it shows the suggestion to the developer.
-
----
-
-# Why this approach is safer
-
-Consider:
-
-```text
-E0502
-```
-
-There may be several valid solutions:
-
-```text
-1. Reorder the code
-2. Reduce the borrow scope
-3. Create a separate block
-4. Clone the value
-5. Change the data structure
-```
-
-There is no universal solution.
-
-Therefore `rxplain` should say:
-
-```text
-The compiler detected a mutable/immutable borrow conflict.
-
-Possible strategies:
-- reduce the lifetime of the immutable borrow
-- reorder the operations
-- use an owned value where appropriate
-```
-
-but should **not** blindly edit the user's code.
-
----
-
-# Error coverage
-
-`rxplain` does not need to hardcode every Rust compiler error.
-
-Errors are divided into two categories.
-
-| Category                                  | Behavior                            |
-| ----------------------------------------- | ----------------------------------- |
-| Compiler diagnostic available             | Always display compiler information |
-| Common error with educational explanation | Add a simple explanation            |
-| Compiler provides safe suggestion         | Offer/apply suggestion              |
-| No safe suggestion                        | Explain without modifying code      |
-| Unknown error code                        | Display generic compiler diagnostic |
-
-This allows the tool to remain useful even when Rust introduces new diagnostics.
-
----
-
-# Example usage
-
-Run against the current directory:
+Apply safe compiler fixes:
 
 ```bash
-cargo run -- .
+rxplain . --fix
 ```
 
-Run against another Rust project:
+Get JSON output:
 
 ```bash
-cargo run -- /path/to/project
+rxplain . --json
 ```
 
-Run the example project:
+Walk through each error step by step (great for learning ownership and borrowing):
 
 ```bash
-cargo run -- examples/broken_project
+rxplain . --walk
 ```
 
-Request automatic fixes:
+Browse errors in an interactive terminal viewer (`j`/`k` or `↑`/`↓` to select,
+`Space`/`PgUp`/`PgDn` to scroll, `q` to quit):
 
 ```bash
-cargo run -- examples/broken_project --fix
+rxplain . --tui
 ```
 
----
+Run the guided demo:
 
-# Example output
+```bash
+bash demo/demo.sh
+```
+
+## 🛠️ Before / after — what rxplain adds
+
+Rust beginners often hit an ownership or borrowing error and stare at the bare compiler
+lines, unsure *where* the conflict is or *why* the rule exists. Here is the same E0502
+error before and after rxplain.
+
+**Before — raw compiler output:**
+
+```
+error[E0502]: cannot borrow `value` as mutable because it is also borrowed as immutable
+ --> src/main.rs:4:29
+  |
+3 |     let reference = &value;
+  |              ----- immutable borrow occurs here
+4 |     let mutable_reference = &mut value;
+  |                             ^^^^^^ mutable borrow occurs here
+5 |     println!("{}", reference);
+  |              -------- immutable borrow later used here
+```
+
+**After — `rxplain .`:**
 
 ```text
-Building project...
+✖ 1 error found in 0 seconds
 
-1 error found
+   ERROR E0502
 
-[1/1] E0382
-Use of a moved value
+  ▸ Compiler message
+    cannot borrow `value` as mutable because it is also borrowed as immutable
 
-Location:
-src/main.rs:6
+  ▸ Compiler evidence
+    ● src/main.rs:3:21   let reference = &value;
+      └─ immutable borrow occurs here
+    ● src/main.rs:4:29   let mutable_reference = &mut value;
+      └─ mutable borrow occurs here
+    ● src/main.rs:5:20   println!("{}", reference);
+      └─ immutable borrow later used here
 
-Code:
-println!("{}", name);
+  ▸ Why these locations are related
+    › Line 3 is related to line 4: immutable borrow → mutable borrow.
+    › Line 5 is the last use of the immutable borrow.
 
-What happened:
-The value `name` was moved earlier and is being used again.
+  ┌ ────────── ┐
+  │ Conflicting borrows (E0502) │
+  └ ────────── ┘
+    🏷 Concept: Borrowing
+    The immutable reference `reference` is still in use when `&mut value` is created.
 
-Moved at:
-src/main.rs:4
-
-Compiler suggestion:
-name.clone()
-
-Suggestion status:
-MachineApplicable
-
-Auto-fix:
-Available
-
-------------------------------------------------------------
+  🔧 Possible fixes
+    • Ensure the immutable borrow ends before the mutable borrow begins.
+    • Narrow the scope of the immutable borrow.
+    • Clone the value if an owned copy is acceptable.
 ```
 
-For an error without a safe compiler suggestion:
+rxplain ties every line of the compiler diagnostic to the *reason* behind it (Ownership,
+Borrowing, Lifetimes), shows the surrounding source, and lists concrete fixes — so a
+confused new user knows **where** the conflict is, **why** the rule exists, and **how**
+to proceed.
+
+For the degree learners who still feel stuck, `--walk` turns the same explanation into a
+guided STEP 1 → STEP 4 tutorial, and `--tui` lets them flip between all errors in an
+interactive viewer.
+
+## 🧪 Testing
+
+Run the tests:
+
+```bash
+cargo test
+```
+
+Run the benchmark:
+
+```bash
+./benchmark/run.sh
+```
+
+Current benchmark (17 cases):
 
 ```text
-E0502
-Cannot borrow as mutable because it is also borrowed as immutable
-
-Location:
-src/main.rs:12
-
-What happened:
-The compiler detected an active immutable borrow when
-the code attempted to create a mutable borrow.
-
-Possible approaches:
-- shorten the immutable borrow
-- reorder the operations
-- restructure the code
-- clone the value when appropriate
-
-Auto-fix:
-Not available because the correct solution depends
-on the program's intended behavior.
+17 / 17 diagnostic cases detected
+17 / 17 explanations provided
+17 / 17 concept coverage
+4  / 4  machine-safe fixes detected
+3  / 4  auto-fixes verified as repairing the project
 ```
 
----
-
-# Development phases
-
-## Phase 1 — Project setup
-
-Completed.
-
-Tasks:
-
-* initialize Cargo project
-* add dependencies
-* create module structure
-* create example Rust project
-
----
-
-## Phase 2 — Compiler execution
-
-Completed.
-
-`runner.rs` executes Cargo and captures structured compiler output.
-
----
-
-## Phase 3 — Diagnostic parsing
-
-Completed.
-
-`diagnostics.rs` converts rustc JSON diagnostics into internal structures.
-
-The parser extracts:
-
-* error code
-* message
-* file
-* line
-* snippets
-* spans
-* compiler suggestions
-* suggestion applicability
-
----
-
-## Phase 4 — Basic explanation engine
-
-Completed.
-
-`explain.rs` provides:
-
-* compiler error information
-* plain-English explanations
-* relevant fix strategies
-* actual source locations
-
-The explanation system should not assume that one error code always has one solution.
-
----
-
-## Phase 5 — CLI integration
-
-Completed.
-
-`main.rs` connects:
+## 🏗️ Project structure
 
 ```text
-runner
-   ↓
-diagnostics
-   ↓
-explain
-   ↓
-fixer
+src/
+├── main.rs         # CLI
+├── runner.rs       # Cargo execution
+├── diagnostics.rs  # rustc JSON parsing
+├── context.rs      # source context
+├── analyzer.rs     # diagnostic analysis
+├── explain.rs      # explanations
+├── fixer.rs        # safe compiler-driven fixes
+├── walk.rs         # step-by-step tutorial mode
+└── tui.rs          # interactive terminal browser
+benchmark/          # evaluation harness + 17 error cases
+demo/               # guided demo script + fixtures
+evaluation/         # real-project phase 12 evaluation target + report
+phases.md           # development roadmap and status
 ```
 
-and displays the result in the terminal.
+## 🎯 Design principle
 
----
+> **Use the Rust compiler as the source of truth.**
 
-# Phase 6 — Compiler-driven fix system
+`rxplain` does not assume that an error code always has one solution. Automatic changes are made only when the compiler explicitly marks a suggestion as `MachineApplicable`. Ownership, borrowing, and lifetime explanations are **span-aware**: they describe the compiler's own reported locations rather than generic advice.
 
-This is the next important development phase.
+## 📌 Status
 
-Instead of hardcoding:
+**Working, tested, and demo-ready.**
 
-```rust
-E0382 → insert .clone()
-```
-
-implement:
+Tested error codes:
 
 ```text
-ParsedError
-    ↓
-Check compiler suggestion
-    ↓
-Check suggestion applicability
-    ↓
-Determine whether it is safe
-    ↓
-Apply exact compiler replacement
+E0106 · E0277 · E0282 · E0308 · E0382 · E0384 · E0432 · E0433 · E0499 · E0500 ·
+E0502 · E0503 · E0505 · E0506 · E0515 · E0521 · E0596 · E0597 · E0599 · E0716
 ```
 
-The fixer should work from the diagnostic's actual:
+The generic fallback surfaces the compiler's own machine-applicable suggestion for any
+error code not yet covered, so even unknown errors get a concrete, factual fix.
+
+Tested behaviors:
 
 ```text
-file_name
-line_start
-column_start
-suggested_replacement
-suggestion_applicability
+✓ Detection of 20 error classes
+✓ Span-aware explanations with concept tagging
+✓ Generic fallback for unknown errors (surfaces real compiler suggestion)
+✓ Human-readable and JSON output
+✓ Step-by-step --walk tutorial mode
+✓ Interactive --tui terminal browser
+✓ MachineApplicable auto-fix with post-fix verification
+✓ 24 automated tests passing
+✓ Benchmark: 17/17 detection, 17/17 concept coverage, 3/4 verified repairs
 ```
 
-This allows the fixer to work across many different code examples.
-
----
-
-# Phase 7 — Better contextual explanations
-
-Improve explanations using:
-
-* primary span
-* secondary spans
-* labels
-* surrounding source code
-* compiler child diagnostics
-* compiler suggestions
-
-The goal is to explain:
+## 🖥️ CLI reference
 
 ```text
-WHAT happened
-WHERE it happened
-WHY Rust rejected it
-WHAT the compiler suggests
-WHETHER it can be safely automated
+rxplain [PROJECT_DIR]           Analyze the Rust project and explain its errors
+rxplain [PROJECT_DIR] --fix     Apply machine-applicable compiler suggestions
+rxplain [PROJECT_DIR] --json    Output the full report as JSON
+rxplain [PROJECT_DIR] --walk    Step-by-step tutorial mode (ownership & borrow errors)
+rxplain [PROJECT_DIR] --tui     Interactive terminal browser (j/k navigate, q quit)
+rxplain [PROJECT_DIR] --quiet   Suppress the banner (plain output)
+rxplain --version               Print the version
 ```
 
----
+`--tui` requires an interactive terminal; when stdin/stdout are not terminals it
+automatically falls back to the plain report.
 
-# Phase 8 — Testing
+## 🔌 Editor / tool integration
 
-Create multiple real Rust fixtures.
+`--json` emits a structured report designed for editors, LSP servers, CI, and other tools.
+Each entry in the `errors` array has:
 
-Examples:
+```json
+{
+  "code": "E0308",
+  "message": "mismatched types",
+  "locations": [ { "file": "src/main.rs", "line": 3, "column": 13,
+                   "snippet": "...", "label": "..." } ],
+  "relationships": [ "Line 3 is related to line 3: ..." ],
+  "explanation": { "title": "Mismatched types (E0308)",
+                   "summary": "...", "concept": "Types",
+                   "fix_options": [ "...", "..." ] },
+  "suggestions": [ { "file": "...", "line": 1, "column": 26,
+                     "replacement": "&mut ", "applicability": "MachineApplicable",
+                     "label": "..." } ],
+  "fix": { "kind": "RequiresHumanJudgment | CompilerSuggested",
+           "description": "...", "file": null, "line": null,
+           "column": null, "replacement": null, "applicability": null }
+}
+```
+
+A ready-made consumer (`examples/json_consumer.sh`) projects this down to the fields a
+diagnostics panel needs:
+
+```bash
+bash examples/json_consumer.sh path/to/project
+```
+
+## 🧭 Architecture
 
 ```text
-tests/
-├── fixtures/
-│   ├── e0382/
-│   ├── e0502/
-│   ├── e0499/
-│   ├── e0597/
-│   └── e0308/
-│
-└── integration_tests.rs
+src/
+├── main.rs         CLI (clap) + human/JSON rendering
+├── runner.rs       Invokes `cargo check --message-format=json`
+├── diagnostics.rs  Parses rustc JSON diagnostics into ParsedError (+ suggestions)
+├── context.rs      Captures the relevant source context around each span
+├── analyzer.rs     Locations, relationships, compiler fixes, type extraction
+├── explain.rs      Explanations; span-aware summaries + concept + fix options
+├── fixer.rs        Safe, overlap-guarded, multi-file auto-fix + build verification
+├── walk.rs         `--walk` tutorial mode: STEP 1 problem → STEP 2 where → STEP 3 why → STEP 4 fix
+└── tui.rs          `--tui` ratatui browser: error list + scrollable explanation
 ```
 
-Tests should verify that the system works across different code patterns rather than checking only one hardcoded example.
+## 📊 Benchmark methodology
 
----
+`benchmark/run.sh` drives 17 isolated fixtures (one per supported error code). For each
+it measures: **detection** (does rxplain surface the exact `<CODE>` error), **explanation**
+(present), **concept coverage**, and **verified repair** (copies the fixture, applies
+`--fix`, and confirms a subsequent build reports success). Fixtures are copies so the
+originals are never mutated.
 
-# Phase 9 — Documentation and evaluation
+## ⚠️ Limitations
 
-Evaluate `rxplain` against:
+- Coverage is a fixed set of common error codes plus a generic fallback; rarer codes get
+  the fallback, which only echoes the compiler message and its real suggestion.
+- `--fix` applies **only** `MachineApplicable` suggestions; `MayBeIncorrect` ones are
+  refused to avoid wrong edits, so not every error is auto-repairable.
+- A hard error in the library crate stops `cargo check` before the binary crate is
+  compiled, so errors are reported per-crate in compiler order.
+- Explanations are deterministic and offline; `fix_options`/`concept` are reference text,
+  while the summary is stitched from the compiler's own labels and lines.
 
-* raw `rustc --explain`
-* normal Cargo diagnostics
-* `cargo fix`
-* manually written explanations
+## 📦 Packaging & release
 
-Measure:
+Build an optimized release binary:
 
-* diagnostic parsing accuracy
-* explanation usefulness
-* safe-fix accuracy
-* number of unsupported cases
-* false auto-fix rate
-
-A particularly important metric is:
-
-> **Number of incorrect automatic modifications.**
-
-The target should be **zero unsafe automatic fixes**.
-
----
-
-# Phase 10 — Interactive UI
-
-Optional final-year stretch goal.
-
-Possible interface:
-
-```text
-┌─────────────────────────────────────────────┐
-│ rxplain                                     │
-├─────────────────────────────────────────────┤
-│ E0382 — Use of moved value                  │
-│                                             │
-│ src/main.rs:6                               │
-│                                             │
-│ 4 │ let other = name;                       │
-│ 6 │ println!("{}", name);                   │
-│                     ^^^^^                   │
-│                                             │
-│ What happened                               │
-│ `name` was moved at line 4.                 │
-│                                             │
-│ Suggested fix                               │
-│ name.clone()                                │
-│                                             │
-│ [ Apply Fix ]       [ Ignore ]              │
-└─────────────────────────────────────────────┘
+```bash
+cargo build --release
 ```
 
----
+Create a tagged GitHub release (`scripts/release.sh` builds the binary into a tarball
+and uploads it via the GitHub CLI):
 
-# Technology
-
-| Technology              | Purpose                         |
-| ----------------------- | ------------------------------- |
-| Rust                    | Application implementation      |
-| Cargo                   | Build and project management    |
-| rustc                   | Source of compiler diagnostics  |
-| `--message-format=json` | Structured diagnostic interface |
-| serde                   | Deserialize compiler JSON       |
-| serde_json              | JSON parsing                    |
-| clap                    | CLI arguments                   |
-| colored                 | Terminal presentation           |
-| anyhow                  | Error handling                  |
-
-No external AI API is required.
-
-No API key is required.
-
-No database is required.
-
-No internet connection is required for the core functionality.
-
----
-
-# Design goals
-
-`rxplain` is designed around five principles:
-
-### 1. Compiler-first
-
-Rust's compiler is the source of truth.
-
-### 2. Context-aware
-
-Explanations should refer to the user's actual file, line, span, and diagnostic information.
-
-### 3. Conservative
-
-Never automatically change code when the correct solution depends on developer intent.
-
-### 4. Deterministic
-
-The same compiler diagnostic should produce the same result.
-
-### 5. Extensible
-
-New Rust compiler errors should remain usable even before a custom educational explanation is implemented.
-
----
-
-# Final-year project value
-
-The project is not simply an error-message wrapper.
-
-The main engineering problem is building a reliable diagnostic pipeline:
-
-```text
-Compiler
-   ↓
-Structured diagnostic extraction
-   ↓
-Diagnostic normalization
-   ↓
-Context analysis
-   ↓
-Human-readable explanation
-   ↓
-Safe suggestion evaluation
-   ↓
-Optional source transformation
+```bash
+./scripts/release.sh v0.1.0
 ```
 
-This makes the project suitable for further research and development in:
+Changelog and version notes live in `CHANGELOG.md`.
 
-* compiler tooling
-* developer experience
-* static analysis
-* program repair
-* automated code transformation
-* programming-language education
+## License
 
----
-
-# Current status
-
-```text
-Phase 1  ████████████████████ Complete
-Phase 2  ████████████████████ Complete
-Phase 3  ████████████████████ Complete
-Phase 4  ████████████████████ Complete
-Phase 5  ████████████████████ Complete
-Phase 6  ███████████░░░░░░░░░ In progress
-Phase 7  ░░░░░░░░░░░░░░░░░░░░ Planned
-Phase 8  ░░░░░░░░░░░░░░░░░░░░ Planned
-Phase 9  ░░░░░░░░░░░░░░░░░░░░ Planned
-Phase 10 ░░░░░░░░░░░░░░░░░░░░ Optional
-```
-
----
-
-# License
-
-To be decided.
+MIT
