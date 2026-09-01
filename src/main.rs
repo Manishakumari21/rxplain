@@ -77,6 +77,7 @@ struct JsonExplanation {
     title: String,
     summary: String,
     concept: Option<String>,
+    principle: Option<String>,
     fix_options: Vec<String>,
 }
 
@@ -278,6 +279,7 @@ fn print_json_report(errors: &[ParsedError]) -> Result<()> {
                 title: explanation.title,
                 summary: explanation.plain_summary,
                 concept: explanation.concept,
+                principle: explanation.principle,
                 fix_options: explanation.fix_options,
             },
             suggestions,
@@ -466,6 +468,15 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                 "🏷".white(),
                 "Concept:".cyan().bold(),
                 concept.cyan()
+            );
+        }
+
+        if let Some(principle) = &explanation.principle {
+            println!(
+                "    {} {} {}",
+                "💭".white(),
+                "The rule:".cyan().bold(),
+                principle.white()
             );
         }
 

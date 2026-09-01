@@ -132,6 +132,14 @@ fn explains_moved_value_from_compiler_labels() {
     assert_eq!(explanation.concept.as_deref(), Some("Ownership"));
     assert!(explanation.plain_summary.contains("move occurs because"));
     assert!(explanation.plain_summary.contains("line 4"));
+
+    assert!(
+        explanation
+            .principle
+            .as_deref()
+            .unwrap()
+            .contains("exactly one owner")
+    );
 }
 
 #[test]
@@ -155,6 +163,14 @@ fn explains_mutable_borrow_conflict_from_compiler_labels() {
     assert_eq!(explanation.concept.as_deref(), Some("Borrowing"));
     assert!(explanation.plain_summary.contains("first mutable borrow"));
     assert!(explanation.plain_summary.contains("line 3"));
+
+    assert!(
+        explanation
+            .principle
+            .as_deref()
+            .unwrap()
+            .contains("many immutable references")
+    );
 }
 
 #[test]
@@ -175,6 +191,7 @@ fn generic_explanation_for_unknown_error() {
     assert_eq!(explanation.concept, None);
     assert!(explanation.title.contains("E9999"));
     assert!(explanation.plain_summary.contains("some future error"));
+    assert_eq!(explanation.principle, None);
 }
 
 #[test]

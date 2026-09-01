@@ -7,10 +7,11 @@ pub struct Explanation {
     pub plain_summary: String,
     pub fix_options: Vec<String>,
     pub concept: Option<String>,
+    pub principle: Option<String>,
 }
 
 pub fn explain(error: &ParsedError, analysis: &DiagnosticAnalysis) -> Explanation {
-    match error.code.as_str() {
+    let mut explanation = match error.code.as_str() {
         "E0308" => explain_types(error, analysis),
         "E0382" => explain_moved_value(error),
         "E0384" => explain_immutable_assignment(error),
@@ -31,6 +32,51 @@ pub fn explain(error: &ParsedError, analysis: &DiagnosticAnalysis) -> Explanatio
         "E0432" | "E0433" => explain_unresolved_path(error),
         "E0716" => explain_temporary_dropped(error),
         _ => generic_explanation(error),
+    };
+
+    if let Some(concept) = &explanation.concept {
+        explanation.principle = principle_for(concept).map(str::to_string);
+    }
+
+    explanation
+}
+
+/// The one-sentence rule behind each concept — the "why" a newcomer is missing.
+fn principle_for(concept: &str) -> Option<&'static str> {
+    match concept {
+        "Ownership" => Some(
+            "Every value has exactly one owner at a time. Moving it to a new owner \
+             leaves the old binding invalid, so it can no longer be used.",
+        ),
+        "Borrowing" => Some(
+            "At any moment a value can have either many immutable references or one \
+             mutable reference — never both, because concurrent reads and writes would race.",
+        ),
+        "Lifetimes" => Some(
+            "A reference must never outlive the data it points to. Each borrow carries \
+             a lifetime, which the compiler checks to guarantee dangling references cannot exist.",
+        ),
+        "Mutability" => Some(
+            "Bindings are read-only by default. Declaring `mut` is you, the programmer, \
+             stating that you intend to write to the value.",
+        ),
+        "Traits" => Some(
+            "Traits are Rust's contracts: a type only gains the behavior described by a \
+             trait when it implements that trait (or the trait is otherwise in scope).",
+        ),
+        "Methods & Traits" => Some(
+            "A method call only works if the type provides that method — either defined on \
+             the type itself or via a trait that is in scope.",
+        ),
+        "Type Inference" => Some(
+            "Rust usually infers types from usage. When the code alone doesn't pin the type \
+             down, the compiler asks you to state it explicitly.",
+        ),
+        "Paths & Modules" => Some(
+            "A name is usable only if it can be resolved: the item must exist and be \
+             reachable from the path you wrote.",
+        ),
+        _ => None,
     }
 }
 
@@ -69,6 +115,7 @@ fn generic_explanation(error: &ParsedError) -> Explanation {
         plain_summary: format!("Rust reported: {}", error.raw_message),
         fix_options,
         concept: None,
+        principle: None,
     }
 }
 
@@ -113,6 +160,7 @@ fn explain_moved_value(error: &ParsedError) -> Explanation {
             "Reorder the code so the value is used before it is moved.".to_string(),
         ],
         concept: Some("Ownership".to_string()),
+        principle: None,
     }
 }
 
@@ -140,6 +188,7 @@ fn explain_immutable_assignment(error: &ParsedError) -> Explanation {
             "Use a new `let` binding instead of reassigning.".to_string(),
         ],
         concept: Some("Mutability".to_string()),
+        principle: None,
     }
 }
 
@@ -164,6 +213,7 @@ fn explain_multiple_mutable_borrows(error: &ParsedError) -> Explanation {
             "Use a single `&mut` if the borrows can be merged.".to_string(),
         ],
         concept: Some("Borrowing".to_string()),
+        principle: None,
     }
 }
 
@@ -188,6 +238,7 @@ fn explain_borrow_conflict(error: &ParsedError) -> Explanation {
             "Clone the value if an owned copy is acceptable.".to_string(),
         ],
         concept: Some("Borrowing".to_string()),
+        principle: None,
     }
 }
 
@@ -212,6 +263,7 @@ fn explain_borrow_with_existing_mut(error: &ParsedError) -> Explanation {
             "If sharing is intended, avoid mutating while references exist.".to_string(),
         ],
         concept: Some("Borrowing".to_string()),
+        principle: None,
     }
 }
 
@@ -236,6 +288,7 @@ fn explain_moved_while_borrowed(error: &ParsedError) -> Explanation {
             "Reorder so the move happens after the borrow is finished.".to_string(),
         ],
         concept: Some("Ownership".to_string()),
+        principle: None,
     }
 }
 
@@ -260,6 +313,7 @@ fn explain_assign_while_borrowed(error: &ParsedError) -> Explanation {
             "Mutate via the reference if it is a `&mut` borrow.".to_string(),
         ],
         concept: Some("Borrowing".to_string()),
+        principle: None,
     }
 }
 
@@ -289,6 +343,7 @@ fn explain_return_referencing_local(error: &ParsedError) -> Explanation {
             "Use a smart pointer like `Box` or `Rc` to extend the value's lifetime.".to_string(),
         ],
         concept: Some("Lifetimes".to_string()),
+        principle: None,
     }
 }
 
@@ -316,6 +371,7 @@ fn explain_borrowed_data_escapes(error: &ParsedError) -> Explanation {
                 .to_string(),
         ],
         concept: Some("Lifetimes".to_string()),
+        principle: None,
     }
 }
 
@@ -354,6 +410,7 @@ fn explain_move_while_borrowed(error: &ParsedError) -> Explanation {
             "Clone the value if it must be moved while borrowed.".to_string(),
         ],
         concept: Some("Ownership".to_string()),
+        principle: None,
     }
 }
 
@@ -390,6 +447,7 @@ fn explain_borrowed_not_long_enough(error: &ParsedError) -> Explanation {
             "Extend the scope of the value or restructure so the reference is valid.".to_string(),
         ],
         concept: Some("Lifetimes".to_string()),
+        principle: None,
     }
 }
 
@@ -410,6 +468,7 @@ fn explain_missing_lifetime(error: &ParsedError) -> Explanation {
             "Use an explicit lifetime on the reference that is returned.".to_string(),
         ],
         concept: Some("Lifetimes".to_string()),
+        principle: None,
     }
 }
 
@@ -430,6 +489,7 @@ fn explain_trait_bound(error: &ParsedError) -> Explanation {
             "Use a type that already satisfies the trait bound.".to_string(),
         ],
         concept: Some("Traits".to_string()),
+        principle: None,
     }
 }
 
@@ -451,6 +511,7 @@ fn explain_mutable_borrow(error: &ParsedError) -> Explanation {
             "If the mutation is not required, change the receiver/parameter type.".to_string(),
         ],
         concept: Some("Borrowing".to_string()),
+        principle: None,
     }
 }
 
@@ -472,6 +533,7 @@ fn explain_method_not_found(error: &ParsedError) -> Explanation {
             "If the method belongs to a trait, bring that trait into scope with `use`.".to_string(),
         ],
         concept: Some("Methods & Traits".to_string()),
+        principle: None,
     }
 }
 
@@ -494,6 +556,7 @@ fn explain_type_annotation(error: &ParsedError) -> Explanation {
                 .to_string(),
         ],
         concept: Some("Type Inference".to_string()),
+        principle: None,
     }
 }
 
@@ -515,6 +578,7 @@ fn explain_unresolved_path(error: &ParsedError) -> Explanation {
             "Ensure any required dependency is declared under `[dependencies]`.".to_string(),
         ],
         concept: Some("Paths & Modules".to_string()),
+        principle: None,
     }
 }
 
@@ -536,6 +600,7 @@ fn explain_temporary_dropped(error: &ParsedError) -> Explanation {
             "Restructure so the reference does not outlive the temporary.".to_string(),
         ],
         concept: Some("Lifetimes".to_string()),
+        principle: None,
     }
 }
 
@@ -552,6 +617,7 @@ fn explain_types(error: &ParsedError, analysis: &DiagnosticAnalysis) -> Explanat
                 plain_summary: summary,
                 fix_options: fixes,
                 concept: Some("Types".to_string()),
+                principle: None,
             }
         }
 
@@ -566,6 +632,7 @@ fn explain_types(error: &ParsedError, analysis: &DiagnosticAnalysis) -> Explanat
                 "Check the type of the value being provided.".to_string(),
             ],
             concept: Some("Types".to_string()),
+            principle: None,
         },
     }
 }

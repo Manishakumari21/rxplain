@@ -184,6 +184,13 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
         ]));
     }
 
+    if let Some(principle) = &explanation.principle {
+        lines.push(Line::from(vec![
+            Span::styled("The rule: ", Style::default().fg(Color::Cyan)),
+            Span::styled(principle.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
+
     lines.push(Line::from(explanation.plain_summary));
 
     if !explanation.fix_options.is_empty() {

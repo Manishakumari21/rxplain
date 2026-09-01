@@ -7,6 +7,7 @@
 ## ✨ Features
 
 * Context-aware Rust compiler error explanations
+* The **rule behind the concept** — teaches *why* the rule exists, not just *where*
 * Source locations, spans, and related diagnostics
 * Compiler-provided suggestions
 * Safe `--fix` for `MachineApplicable` suggestions
@@ -150,6 +151,9 @@ error[E0502]: cannot borrow `value` as mutable because it is also borrowed as im
   │ Conflicting borrows (E0502) │
   └ ────────── ┘
     🏷 Concept: Borrowing
+    💭 The rule: At any moment a value can have either many immutable references
+      or one mutable reference — never both, because concurrent reads and
+      writes would race.
     The immutable reference `reference` is still in use when `&mut value` is created.
 
   🔧 Possible fixes
@@ -234,7 +238,7 @@ Tested behaviors:
 
 ```text
 ✓ Detection of 20 error classes
-✓ Span-aware explanations with concept tagging
+✓ Span-aware explanations with concept tagging + the rule behind it
 ✓ Generic fallback for unknown errors (surfaces real compiler suggestion)
 ✓ Human-readable and JSON output
 ✓ Step-by-step --walk tutorial mode
@@ -273,6 +277,7 @@ Each entry in the `errors` array has:
   "relationships": [ "Line 3 is related to line 3: ..." ],
   "explanation": { "title": "Mismatched types (E0308)",
                    "summary": "...", "concept": "Types",
+                   "principle": "Rust usually infers types from usage...",
                    "fix_options": [ "...", "..." ] },
   "suggestions": [ { "file": "...", "line": 1, "column": 26,
                      "replacement": "&mut ", "applicability": "MachineApplicable",

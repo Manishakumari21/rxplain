@@ -140,6 +140,10 @@ fn walk_error(error: &ParsedError, project_dir: &str) {
         );
     }
 
+    if let Some(principle) = &explanation.principle {
+        println!("  {} {}", "The rule:".cyan().bold(), principle.white());
+    }
+
     println!("  {}", explanation.plain_summary.white());
 
     if !analysis.relationships.is_empty() {
