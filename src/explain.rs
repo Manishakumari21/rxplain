@@ -41,7 +41,6 @@ pub fn explain(error: &ParsedError, analysis: &DiagnosticAnalysis) -> Explanatio
     explanation
 }
 
-/// The one-sentence rule behind each concept — the "why" a newcomer is missing.
 fn principle_for(concept: &str) -> Option<&'static str> {
     match concept {
         "Ownership" => Some(

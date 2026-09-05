@@ -1,4 +1,3 @@
-use crate::Cli;
 use crate::analyzer;
 use crate::context;
 use crate::diagnostics::ParsedError;
@@ -23,12 +22,14 @@ pub struct App {
 }
 
 impl App {
-    fn new(errors: Vec<ParsedError>, cli: &Cli) -> Self {
+    fn new(errors: Vec<ParsedError>, project_dir: &str) -> Self {
         let prepared = errors
             .iter()
-            .map(|error| prepare_error(error, &cli.project_dir))
+            .map(|error| prepare_error(error, project_dir))
             .collect();
+
         let list_state = ListState::default();
+
         Self {
             errors,
             selected: 0,
@@ -76,8 +77,9 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
     ]));
 
     lines.push(Line::from(""));
+
     lines.push(Line::from(vec![Span::styled(
-        "Compiler evidence".to_string(),
+        "Compiler evidence",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -97,9 +99,11 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
                 location.file, location.line, location.column
             )),
         ]));
+
         if !location.snippet.is_empty() {
             lines.push(Line::from(format!("    {}", location.snippet)));
         }
+
         if let Some(label) = &location.label {
             lines.push(Line::from(Span::styled(
                 format!("    └─ {}", label),
@@ -109,10 +113,12 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
     }
 
     let contexts = context::SourceContext::from_error(error, project_dir);
+
     if !contexts.is_empty() {
         lines.push(Line::from(""));
+
         lines.push(Line::from(vec![Span::styled(
-            "Source context".to_string(),
+            "Source context",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -121,6 +127,7 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
         for source_context in &contexts {
             for line in &source_context.lines {
                 let marker = if line.highlighted { "►" } else { " " };
+
                 let gutter = format!("{:>4}", line.line_number);
 
                 let display = if line.highlighted {
@@ -148,13 +155,14 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
                         ),
                     ])
                 };
+
                 lines.push(display);
 
                 if line.highlighted
                     && let Some(label) = &line.label
                 {
                     lines.push(Line::from(vec![
-                        Span::styled("          │ ".to_string(), Style::default().fg(Color::Red)),
+                        Span::styled("          │ ", Style::default().fg(Color::Red)),
                         Span::styled(format!("^ {}", label), Style::default().fg(Color::Red)),
                     ]));
                 }
@@ -165,8 +173,9 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
     let explanation = explain::explain(error, &analysis);
 
     lines.push(Line::from(""));
+
     lines.push(Line::from(vec![Span::styled(
-        "Explanation".to_string(),
+        "Explanation",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -195,8 +204,9 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
 
     if !explanation.fix_options.is_empty() {
         lines.push(Line::from(""));
+
         lines.push(Line::from(vec![Span::styled(
-            "Possible fixes".to_string(),
+            "Possible fixes",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -211,9 +221,11 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
     }
 
     let fix = fixer::suggest_fix(error);
+
     lines.push(Line::from(""));
+
     lines.push(Line::from(vec![Span::styled(
-        "Fix classification".to_string(),
+        "Fix classification",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -225,6 +237,7 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
                 Span::styled("✔ ", Style::default().fg(Color::Green)),
                 Span::styled(fix.description, Style::default().fg(Color::Green)),
             ]));
+
             if let Some(suggestion) = &fix.suggestion {
                 lines.push(Line::from(Span::styled(
                     format!(
@@ -235,6 +248,7 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
                 )));
             }
         }
+
         fixer::FixKind::RequiresHumanJudgment => {
             lines.push(Line::from(vec![
                 Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
@@ -246,51 +260,65 @@ fn prepare_error(error: &ParsedError, project_dir: &str) -> Vec<Line<'static>> {
     lines
 }
 
-pub fn run(errors: &[ParsedError], cli: &Cli) -> Result<()> {
+pub fn run(errors: &[ParsedError], project_dir: &str) -> Result<()> {
     if errors.is_empty() {
         println!("✔ No compiler errors found.");
         return Ok(());
     }
 
     let mut terminal = ratatui::init();
+
     terminal.clear()?;
     terminal.show_cursor()?;
-    let result = event_loop(&mut terminal, errors, cli);
+
+    let result = event_loop(&mut terminal, errors, project_dir);
+
     ratatui::restore();
+
     result
 }
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     errors: &[ParsedError],
-    cli: &Cli,
+    project_dir: &str,
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
-    let mut app = App::new(errors.to_vec(), cli);
+    let mut app = App::new(errors.to_vec(), project_dir);
+
     app.select(0);
 
     loop {
-        terminal.draw(|frame| ui(frame, &mut app))?;
+        terminal.draw(|frame| {
+            ui(frame, &mut app);
+        })?;
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    break;
+                }
+
                 KeyCode::Down | KeyCode::Char('j') => {
                     app.select(app.selected.saturating_add(1));
                 }
+
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.select(app.selected.saturating_sub(1));
                 }
+
                 KeyCode::PageDown | KeyCode::Char(' ') => {
                     app.scroll = app.scroll.saturating_add(10);
                 }
+
                 KeyCode::PageUp => {
                     app.scroll = app.scroll.saturating_sub(10);
                 }
+
                 _ => {}
             }
         }
@@ -301,6 +329,7 @@ fn event_loop(
 
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let outer = frame.area();
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
@@ -312,6 +341,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         .enumerate()
         .map(|(index, error)| {
             let selected = index == app.selected;
+
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(" {} ", error.code),

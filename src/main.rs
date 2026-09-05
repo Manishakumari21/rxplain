@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use colored::*;
 use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
 use serde::Serialize;
@@ -23,28 +23,44 @@ use diagnostics::ParsedError;
     about = "A deterministic, offline explainer for Rust compiler errors"
 )]
 struct Cli {
-    /// Path to the Rust project
-    project_dir: String,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Automatically apply machine-applicable compiler suggestions
-    #[arg(long)]
-    fix: bool,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Check whether a Rust project compiles
+    Check {
+        #[arg(default_value = ".")]
+        project_dir: String,
+    },
 
-    /// Output the diagnostic report as JSON
-    #[arg(long)]
-    json: bool,
+    /// Explain Rust compiler errors
+    Explain {
+        #[arg(default_value = ".")]
+        project_dir: String,
 
-    /// Walk through each error step-by-step, like a guided tutorial
-    #[arg(long)]
-    walk: bool,
+        #[arg(long)]
+        json: bool,
 
-    /// Launch the interactive full-screen terminal UI
-    #[arg(long)]
-    tui: bool,
+        #[arg(long)]
+        walk: bool,
 
-    /// Suppress the decorative banner
-    #[arg(long)]
-    quiet: bool,
+        #[arg(long)]
+        tui: bool,
+
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// Safely apply compiler-suggested fixes
+    Fix {
+        #[arg(default_value = ".")]
+        project_dir: String,
+
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -102,40 +118,246 @@ struct JsonFix {
     applicability: Option<String>,
 }
 
-const BANNER: &str = r#"
-   ██████╗ ██╗  ██╗██████╗ ██╗      █████╗ ██╗███╗   ██╗
-   ██╔══██╗╚██╗██╔╝██╔══██╗██║     ██╔══██╗██║████╗  ██║
-   ██████╔╝ ╚███╔╝ ██████╔╝██║     ███████║██║██╔██╗ ██║
-   ██╔══██╗ ██╔██╗ ██╔═══╝ ██║     ██╔══██║██║██║╚██╗██║
-   ██║  ██║██╔╝ ██╗██║     ███████╗██║  ██║██║██║ ╚████║
-   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝
-"#;
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if !cli.json && !cli.tui && !cli.quiet {
-        print_banner();
-    }
+    match cli.command {
+        Command::Check { project_dir } => check_command(&project_dir),
 
+        Command::Explain {
+            project_dir,
+            json,
+            walk,
+            tui,
+            quiet,
+        } => explain_command(&project_dir, json, walk, tui, quiet),
+
+        Command::Fix {
+            project_dir,
+            dry_run,
+        } => fix_command(&project_dir, dry_run),
+    }
+}
+
+fn check_command(project_dir: &str) -> Result<()> {
     let started = Instant::now();
 
-    let output = if cli.json || cli.tui {
-        runner::run_cargo_build(&cli.project_dir)?
+    let output = runner::run_cargo_build(project_dir)?;
+    let errors = parse_errors(&output);
+
+    let elapsed = started.elapsed();
+
+    if errors.is_empty() {
+        println!(
+            "{} Rust project compiles successfully. {}",
+            "✔".green().bold(),
+            format!("({})", HumanDuration(elapsed)).dimmed()
+        );
+    } else {
+        println!(
+            "{} {} compiler error{} found. {}",
+            "✖".red().bold(),
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" },
+            format!("({})", HumanDuration(elapsed)).dimmed()
+        );
+
+        for error in &errors {
+            println!(
+                "  {} {}: {}",
+                "→".red(),
+                error.code.red().bold(),
+                error.raw_message
+            );
+        }
+
+        println!();
+        println!(
+            "Run {} for detailed explanations.",
+            "rxplain explain".cyan().bold()
+        );
+    }
+
+    Ok(())
+}
+
+fn explain_command(
+    project_dir: &str,
+    json: bool,
+    walk: bool,
+    tui: bool,
+    quiet: bool,
+) -> Result<()> {
+    let started = Instant::now();
+
+    let output = if json || tui {
+        runner::run_cargo_build(project_dir)?
+    } else if quiet {
+        runner::run_cargo_build(project_dir)?
     } else {
         let spinner = ProgressBar::new_spinner();
+
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_strings(&["▖", "▘", "▝", "▗", "▖", "▘", "▝", "▗"])
                 .template("{spinner:.yellow} {msg}")
                 .unwrap(),
         );
-        spinner.set_message(format!("Analyzing {}...", cli.project_dir));
-        let result = runner::run_cargo_build(&cli.project_dir);
+
+        spinner.set_message(format!("Analyzing {}...", project_dir));
+
+        let result = runner::run_cargo_build(project_dir);
+
         spinner.finish_and_clear();
+
         result?
     };
 
+    let errors = parse_errors(&output);
+
+    let cli = Cli {
+        command: Command::Explain {
+            project_dir: project_dir.to_string(),
+            json,
+            walk,
+            tui,
+            quiet,
+        },
+    };
+
+    if json {
+        print_json_report(&errors)?;
+    } else if walk {
+        walk::walk_errors(&errors, project_dir);
+    } else if tui {
+        if std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        {
+            crate::tui::run(&errors, project_dir)?;
+        } else {
+            eprintln!(
+                "note: --tui requires an interactive terminal, \
+                 falling back to plain output"
+            );
+
+            print_human_report(&errors, &cli, started);
+        }
+    } else {
+        print_human_report(&errors, &cli, started);
+    }
+
+    Ok(())
+}
+
+fn fix_command(project_dir: &str, dry_run: bool) -> Result<()> {
+    let started = Instant::now();
+
+    let output = runner::run_cargo_build(project_dir)?;
+    let errors = parse_errors(&output);
+
+    if errors.is_empty() {
+        println!(
+            "{} No compiler errors found. Nothing to fix.",
+            "✔".green().bold()
+        );
+        return Ok(());
+    }
+
+    let mut suggestions = Vec::new();
+
+    for error in &errors {
+        for suggestion in &error.suggestions {
+            if suggestion.applicability == "MachineApplicable" {
+                suggestions.push(suggestion.clone());
+            }
+        }
+    }
+
+    if suggestions.is_empty() {
+        println!(
+            "{} No safe compiler-suggested fixes were found.",
+            "⚠".yellow().bold()
+        );
+
+        println!("  The remaining errors require human judgment.");
+
+        return Ok(());
+    }
+
+    println!(
+        "{} {} safe fix{} found.",
+        "🔧".cyan(),
+        suggestions.len(),
+        if suggestions.len() == 1 { "" } else { "es" }
+    );
+
+    for suggestion in &suggestions {
+        println!();
+        println!(
+            "  {} {}:{}:{}",
+            "→".cyan(),
+            suggestion.file,
+            suggestion.line,
+            suggestion.column
+        );
+
+        println!(
+            "    {} {}",
+            "Replacement:".dimmed(),
+            suggestion.replacement.green()
+        );
+
+        if let Some(label) = &suggestion.label {
+            println!("    {} {}", "Reason:".dimmed(), label.dimmed());
+        }
+
+        println!(
+            "    {} {}",
+            "Safety:".dimmed(),
+            suggestion.applicability.green()
+        );
+    }
+
+    if dry_run {
+        println!();
+        println!("{} Dry run — no files were modified.", "ℹ".cyan().bold());
+
+        return Ok(());
+    }
+
+    println!();
+    println!("{} Applying safe compiler suggestions...", "⏳".yellow());
+
+    fixer::apply_fixes(&suggestions, project_dir)?;
+
+    println!("{} Fixes applied successfully.", "✔".green().bold());
+
+    println!("{} Verifying project...", "⏳".yellow());
+
+    match runner::verify_build(project_dir)? {
+        true => {
+            println!("{} Project now compiles successfully.", "✔".green().bold());
+        }
+
+        false => {
+            println!("{} Project still has compiler errors.", "✖".red().bold());
+
+            println!(
+                "  Run {} to inspect the remaining errors.",
+                "rxplain explain".cyan()
+            );
+        }
+    }
+
+    println!(
+        "{}",
+        format!("Completed in {}", HumanDuration(started.elapsed())).dimmed()
+    );
+
+    Ok(())
+}
+
+fn parse_errors(output: &str) -> Vec<ParsedError> {
     let mut errors = Vec::new();
 
     for line in output.lines() {
@@ -156,43 +378,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if cli.json {
-        print_json_report(&errors)?;
-    } else if cli.walk {
-        walk::walk_errors(&errors, &cli.project_dir);
-    } else if cli.tui {
-        if std::io::IsTerminal::is_terminal(&std::io::stdout())
-            && std::io::IsTerminal::is_terminal(&std::io::stdin())
-        {
-            crate::tui::run(&errors, &cli)?;
-        } else {
-            eprintln!("note: --tui requires an interactive terminal, falling back to plain output");
-            print_human_report(&errors, &cli, started);
-        }
-    } else {
-        print_human_report(&errors, &cli, started);
-    }
-
-    Ok(())
-}
-
-fn print_banner() {
-    println!();
-    for (index, line) in BANNER.lines().enumerate() {
-        let color = match index {
-            0 | 5 => Color::BrightRed,
-            1 | 4 => Color::BrightYellow,
-            _ => Color::BrightCyan,
-        };
-        println!("{}", line.color(color));
-    }
-    println!(
-        "{} {}\n",
-        "✦".yellow(),
-        "Rust error, explained. — deterministic · offline · safe fixes"
-            .white()
-            .italic()
-    );
+    errors
 }
 
 fn print_json_report(errors: &[ParsedError]) -> Result<()> {
@@ -301,26 +487,32 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
 
     if errors.is_empty() {
         println!();
+
         println!(
             "{} {}",
             "✔".green().bold(),
             "No compiler errors found.".green().bold()
         );
+
         println!(
             "  {} {}",
             "⏱".dimmed(),
             format!("Completed in {}", HumanDuration(elapsed)).dimmed()
         );
+
         println!(
             "  {} {}",
             "🎉".white(),
             "All good — your Rust compiles cleanly!".white().dimmed()
         );
+
         println!();
+
         return;
     }
 
     println!();
+
     println!(
         "{} {} {}",
         "✖".red().bold(),
@@ -333,10 +525,12 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
         .bold(),
         format!("in {}", HumanDuration(elapsed)).dimmed()
     );
+
     println!();
 
     for (index, error) in errors.iter().enumerate() {
         println!();
+
         println!(
             "  {}",
             format!(" ERROR {} ", error.code)
@@ -344,6 +538,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                 .bright_white()
                 .bold()
         );
+
         println!(
             "  {} {}{}{} {}",
             "◤".bright_magenta(),
@@ -352,6 +547,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
             " ".repeat(6),
             "◥".bright_magenta()
         );
+
         println!("  {}", "▔".repeat(40).bright_magenta());
 
         println!(
@@ -359,6 +555,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
             "▸".yellow().bold(),
             "Compiler message".white().bold()
         );
+
         println!("    {}", error.raw_message.white().italic());
 
         let analysis = analyzer::analyze(error);
@@ -369,6 +566,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                 "▸".yellow().bold(),
                 "Compiler evidence".white().bold()
             );
+
             for location in &analysis.locations {
                 println!(
                     "    {} {}:{}:{}",
@@ -394,12 +592,13 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                 "▸".yellow().bold(),
                 "Why these locations are related".white().bold()
             );
+
             for relationship in &analysis.relationships {
                 println!("    {} {}", "›".cyan(), relationship.explanation.dimmed());
             }
         }
 
-        let contexts = context::SourceContext::from_error(error, &cli.project_dir);
+        let contexts = context::SourceContext::from_error(error, &project_dir_from_cli(cli));
 
         if !contexts.is_empty() {
             println!(
@@ -407,12 +606,15 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                 "▸".yellow().bold(),
                 "Source context".white().bold()
             );
+
             for source_context in &contexts {
                 if contexts.len() > 1 {
                     println!("    {} {}", "↳".bright_blue(), source_context.file.dimmed());
                 }
+
                 for line in &source_context.lines {
                     let marker = if line.highlighted { "►" } else { " " };
+
                     let gutter_num = format!("{:>4}", line.line_number);
 
                     if line.highlighted {
@@ -448,13 +650,16 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
         let explanation = explain::explain(error, &analysis);
 
         let title_line = format!(" {} ", explanation.title);
+
         println!(
             "\n  {} {} {}",
             "┌".bright_black(),
             "─".repeat(title_line.len()).bright_black(),
             "┐".bright_black()
         );
+
         println!("  │{}│", title_line.bold().white());
+
         println!(
             "  {} {} {}",
             "└".bright_black(),
@@ -484,6 +689,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
 
         if !explanation.fix_options.is_empty() {
             println!("\n  {} {}", "🔧".white(), "Possible fixes".white().bold());
+
             for option in &explanation.fix_options {
                 println!("    {} {}", "•".green(), option.green());
             }
@@ -495,6 +701,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                 "💡".white(),
                 "Compiler suggestions".white().bold()
             );
+
             for suggestion in &analysis.suggestions {
                 println!(
                     "    {} {}:{}:{}",
@@ -515,6 +722,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                     "MaybeIncorrect" => Color::Yellow,
                     _ => Color::White,
                 };
+
                 println!(
                     "      {} {}",
                     "✓".color(app_color),
@@ -559,6 +767,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                         "MaybeIncorrect" => Color::Yellow,
                         _ => Color::White,
                     };
+
                     println!(
                         "    {} {}",
                         "✓".color(app_color).bold(),
@@ -568,75 +777,26 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
                     if let Some(label) = &suggestion.label {
                         println!("    {} {}", "└─".bright_black(), label.dimmed());
                     }
-
-                    if cli.fix {
-                        println!("\n  {} {}", "⏳".yellow(), "Applying fix...".yellow());
-
-                        match fixer::apply_fixes(&error.suggestions, &cli.project_dir) {
-                            Ok(()) => {
-                                println!(
-                                    "  {} {}",
-                                    "✔".green().bold(),
-                                    "Fix applied successfully.".green().bold()
-                                );
-
-                                println!("  {} {}", "⏳".yellow(), "Verifying project...".yellow());
-
-                                match runner::verify_build(&cli.project_dir) {
-                                    Ok(true) => {
-                                        println!(
-                                            "  {} {}",
-                                            "✔".green().bold(),
-                                            "Project now compiles successfully.".green().bold()
-                                        );
-                                    }
-
-                                    Ok(false) => {
-                                        println!(
-                                            "  {} {}",
-                                            "✖".red().bold(),
-                                            "Project still has compiler errors.".red().bold()
-                                        );
-                                    }
-
-                                    Err(error) => {
-                                        println!(
-                                            "  {} {} {}",
-                                            "✖".red().bold(),
-                                            "Failed to verify project:".red().bold(),
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-
-                            Err(error) => {
-                                println!(
-                                    "\n  {} {} {}",
-                                    "✖".red().bold(),
-                                    "Failed to apply fix:".red().bold(),
-                                    error
-                                );
-                            }
-                        }
-                    }
                 }
             }
 
             fixer::FixKind::RequiresHumanJudgment => {
                 println!("    {} {}", "⚠".yellow().bold(), fix.description.yellow());
-
-                if cli.fix {
-                    println!(
-                        "    {} {}",
-                        "⊘".yellow(),
-                        "No automatic fix was applied.".yellow()
-                    );
-                }
             }
         }
 
         println!("\n{}", format!("└{}┘", "─".repeat(58)).bright_black());
+
         println!();
+    }
+}
+
+fn project_dir_from_cli(cli: &Cli) -> String {
+    match &cli.command {
+        Command::Check { project_dir } => project_dir.clone(),
+
+        Command::Explain { project_dir, .. } => project_dir.clone(),
+
+        Command::Fix { project_dir, .. } => project_dir.clone(),
     }
 }

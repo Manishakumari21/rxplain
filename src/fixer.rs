@@ -55,7 +55,14 @@ pub fn apply_fixes(suggestions: &[CompilerSuggestion], project_dir: &str) -> any
     let mut by_file: HashMap<PathBuf, Vec<&CompilerSuggestion>> = HashMap::new();
 
     for suggestion in suggestions {
-        let path = Path::new(project_dir).join(&suggestion.file);
+        let path = crate::context::resolve_project_path(project_dir, &suggestion.file).ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "cannot locate source file inside the target project: {}",
+                    suggestion.file
+                )
+            },
+        )?;
         by_file.entry(path).or_default().push(suggestion);
     }
 

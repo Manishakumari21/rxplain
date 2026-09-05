@@ -42,7 +42,7 @@ impl SourceContext {
     }
 
     fn from_span(span: &Span, project_dir: &str) -> Option<Self> {
-        let path = resolve_source_path(project_dir, &span.file_name)?;
+        let path = resolve_project_path(project_dir, &span.file_name)?;
 
         let source = fs::read_to_string(&path).ok()?;
         let source_lines: Vec<&str> = source.lines().collect();
@@ -88,25 +88,52 @@ impl SourceContext {
     }
 }
 
-fn resolve_source_path(project_dir: &str, file_name: &str) -> Option<PathBuf> {
+pub fn resolve_project_path(project_dir: &str, file_name: &str) -> Option<PathBuf> {
     let file_path = Path::new(file_name);
 
     if file_path.is_absolute() && file_path.exists() {
         return Some(file_path.to_path_buf());
     }
 
-    let project_path = Path::new(project_dir);
+    find_in_project(Path::new(project_dir), file_path, 0)
+}
 
-    let candidate = project_path.join(file_path);
-
-    if candidate.exists() {
-        return Some(candidate);
+fn find_in_project(dir: &Path, relative: &Path, depth: u32) -> Option<PathBuf> {
+    if depth > 6 {
+        return None;
     }
 
-    let candidate = project_path.join("src").join(file_path);
+    let direct = dir.join(relative);
 
-    if candidate.exists() {
-        return Some(candidate);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return None;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if matches!(name.as_ref(), "target" | ".git" | "node_modules") {
+            continue;
+        }
+
+        let path = entry.path();
+
+        if path.is_dir() {
+            let nested = path.join(relative);
+
+            if nested.exists() {
+                return Some(nested);
+            }
+
+            if let Some(found) = find_in_project(&path, relative, depth + 1) {
+                return Some(found);
+            }
+        }
     }
 
     None
