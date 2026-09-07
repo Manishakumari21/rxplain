@@ -226,6 +226,21 @@ fn fix_json_reports_verification_after_isolated_oracle() {
     assert_eq!(applied[0]["kind"], "compiler_suggested");
     assert!(!applied[0]["patch"].as_array().unwrap().is_empty());
 
+    let candidates = value["candidates"].as_array().unwrap();
+    assert!(
+        !candidates.is_empty(),
+        "proposed candidates must be reported"
+    );
+    assert_eq!(
+        candidates[0]["verified"], true,
+        "the verified candidate must be flagged in candidates[]"
+    );
+    assert_eq!(
+        candidates[0]["rejected_reason"],
+        serde_json::Value::Null,
+        "verified candidate has no rejection reason"
+    );
+
     let after = std::fs::read_to_string(project.join("src/main.rs")).unwrap();
     assert!(after.contains("let mut x = 1;"));
 
@@ -283,6 +298,7 @@ fn source_context_resolves_relative_to_external_project() {
             line_end: 2,
             column_start: 17,
             column_end: 24,
+            is_primary: true,
             label: Some("expected `i32`, found `&str`".to_string()),
             text: vec![SpanText {
                 text: "let number: i32 = \"hello\";".to_string(),
@@ -291,6 +307,7 @@ fn source_context_resolves_relative_to_external_project() {
             suggestion_applicability: None,
         }],
         suggestions: Vec::new(),
+        ..Default::default()
     };
 
     let contexts = SourceContext::from_error(&error, &project.to_string_lossy());
@@ -336,6 +353,7 @@ fn source_context_resolves_in_nested_workspace_crate() {
             line_end: 2,
             column_start: 17,
             column_end: 24,
+            is_primary: true,
             label: Some("expected `i32`, found `&str`".to_string()),
             text: vec![SpanText {
                 text: "let number: i32 = \"hello\";".to_string(),
@@ -344,6 +362,7 @@ fn source_context_resolves_in_nested_workspace_crate() {
             suggestion_applicability: None,
         }],
         suggestions: Vec::new(),
+        ..Default::default()
     };
 
     let contexts = SourceContext::from_error(&error, &workspace.to_string_lossy());

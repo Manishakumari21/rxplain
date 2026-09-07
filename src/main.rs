@@ -8,11 +8,14 @@ use std::time::Instant;
 mod analyzer;
 mod context;
 mod diagnostics;
+mod engine;
 mod explain;
 mod fixer;
 mod patch;
 mod repair;
+mod repair_context;
 mod runner;
+mod transform;
 mod tui;
 mod verification;
 mod walk;
@@ -169,7 +172,7 @@ fn main() -> Result<()> {
         result?
     };
 
-    let errors = parse_errors(&output);
+    let errors = engine::parse_diagnostics(&output);
 
     let project_dir = cli.project_dir.clone();
 
@@ -197,8 +200,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-const MAX_REPAIR_ATTEMPTS: u32 = 4;
-
 fn parse_verify_mode(mode: &str) -> Result<verification::VerifyMode> {
     match mode {
         "check" => Ok(verification::VerifyMode::Check),
@@ -208,24 +209,6 @@ fn parse_verify_mode(mode: &str) -> Result<verification::VerifyMode> {
             anyhow::bail!("invalid --verify mode `{other}`: expected `check`, `build`, or `test`")
         }
     }
-}
-
-fn candidate_repairs(
-    errors: &[ParsedError],
-    history: &repair::RepairHistory,
-) -> Vec<repair::RepairCandidate> {
-    let mut candidates: Vec<repair::RepairCandidate> = Vec::new();
-
-    for error in errors {
-        candidates.extend(repair::candidates_for_error(error));
-    }
-
-    candidates = repair::rank_candidates(candidates);
-
-    candidates
-        .into_iter()
-        .filter(|candidate| !history.contains(&candidate.patch))
-        .collect()
 }
 
 fn print_candidates(candidates: &[repair::RepairCandidate], with_preview: bool) {
@@ -255,11 +238,20 @@ fn emit_fix_json(
     status: &str,
     errors: &[ParsedError],
     candidates: &[repair::RepairCandidate],
+    attempted: &[engine::AttemptedCandidate],
     dry_run: bool,
     verification: Option<JsonVerification>,
     attempts: u32,
 ) -> Result<()> {
-    let report = fix_json_report(status, errors, candidates, dry_run, verification, attempts);
+    let report = fix_json_report(
+        status,
+        errors,
+        candidates,
+        attempted,
+        dry_run,
+        verification,
+        attempts,
+    );
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -271,31 +263,46 @@ fn fix_command(
     verify_mode: verification::VerifyMode,
 ) -> Result<()> {
     let started = Instant::now();
+    let config = engine::EngineConfig::from_env();
 
     if !json {
         print_banner();
     }
 
-    let output = runner::run_cargo_build(project_dir)?;
-    let errors = parse_errors(&output);
+    let report = engine::run_repair(project_dir, verify_mode, dry_run, &config)?;
+    let status = report.status;
 
-    if errors.is_empty() {
-        if json {
-            emit_fix_json("nothing_to_repair", &errors, &[], dry_run, None, 0)?;
-        } else {
-            println!(
-                "{} No compiler errors found. Nothing to fix.",
-                "✔".green().bold()
-            );
-        }
-        return Ok(());
-    }
-
-    match verification::reproduce_failure(project_dir, verify_mode) {
-        Ok(true) => {}
-        Ok(false) => {
+    match status {
+        engine::RepairStatus::NoDiagnostic => {
             if json {
-                emit_fix_json("nothing_to_repair", &errors, &[], dry_run, None, 0)?;
+                emit_fix_json(
+                    status.as_str(),
+                    &report.errors,
+                    &report.proposed,
+                    &report.attempted,
+                    dry_run,
+                    None,
+                    0,
+                )?;
+            } else {
+                println!(
+                    "{} No compiler errors found. Nothing to fix.",
+                    "✔".green().bold()
+                );
+            }
+            return Ok(());
+        }
+        engine::RepairStatus::NothingToRepair => {
+            if json {
+                emit_fix_json(
+                    status.as_str(),
+                    &report.errors,
+                    &report.proposed,
+                    &report.attempted,
+                    dry_run,
+                    None,
+                    0,
+                )?;
             } else {
                 println!(
                     "{} Project passes `cargo {}` in isolation; nothing to repair.",
@@ -305,30 +312,49 @@ fn fix_command(
             }
             return Ok(());
         }
-        Err(err) => {
+        engine::RepairStatus::IsolationCheckFailed => {
             if json {
-                emit_fix_json("isolation_check_failed", &errors, &[], dry_run, None, 0)?;
+                emit_fix_json(
+                    status.as_str(),
+                    &report.errors,
+                    &report.proposed,
+                    &report.attempted,
+                    dry_run,
+                    None,
+                    0,
+                )?;
             } else {
-                println!("  {} Isolation check failed: {}", "⚠".yellow(), err);
+                println!(
+                    "  {} Isolation check failed: {}",
+                    "⚠".yellow(),
+                    report.isolation_error.as_deref().unwrap_or("unknown error")
+                );
             }
+            return Ok(());
         }
+        _ => {}
     }
-
-    let mut history = repair::RepairHistory::new();
-    let proposed = candidate_repairs(&errors, &history);
 
     if dry_run {
         if json {
-            emit_fix_json("preview", &errors, &proposed, true, None, 0)?;
+            emit_fix_json(
+                status.as_str(),
+                &report.errors,
+                &report.proposed,
+                &report.attempted,
+                true,
+                None,
+                0,
+            )?;
         } else {
             println!();
             println!(
                 "{} {} candidate repair{} generated (most confident first).",
                 "🔧".cyan(),
-                proposed.len(),
-                if proposed.len() == 1 { "" } else { "s" }
+                report.proposed.len(),
+                if report.proposed.len() == 1 { "" } else { "s" }
             );
-            print_candidates(&proposed, true);
+            print_candidates(&report.proposed, true);
             println!();
             println!("{} Dry run — no files were modified.", "ℹ".cyan().bold());
             println!(
@@ -339,9 +365,17 @@ fn fix_command(
         return Ok(());
     }
 
-    if proposed.is_empty() {
+    if status == engine::RepairStatus::HumanReviewRequired {
         if json {
-            emit_fix_json("human_review_required", &errors, &proposed, false, None, 0)?;
+            emit_fix_json(
+                status.as_str(),
+                &report.errors,
+                &report.proposed,
+                &report.attempted,
+                false,
+                None,
+                0,
+            )?;
         } else {
             println!();
             println!(
@@ -358,10 +392,10 @@ fn fix_command(
         println!(
             "{} {} candidate repair{} generated (most confident first).",
             "🔧".cyan(),
-            proposed.len(),
-            if proposed.len() == 1 { "" } else { "s" }
+            report.proposed.len(),
+            if report.proposed.len() == 1 { "" } else { "s" }
         );
-        print_candidates(&proposed, false);
+        print_candidates(&report.proposed, false);
         println!();
         println!(
             "{} Verifying candidates with `cargo {}` in an isolated workspace...",
@@ -370,82 +404,91 @@ fn fix_command(
         );
     }
 
-    let workspace = match verification::IsolatedWorkspace::create(project_dir) {
-        Ok(ws) => ws,
-        Err(err) => anyhow::bail!("could not create isolated workspace: {}", err),
-    };
+    let tried_candidates: Vec<JsonTriedCandidate> = report
+        .attempted
+        .iter()
+        .map(|attempted| JsonTriedCandidate {
+            kind: attempted.candidate.kind.as_str().to_string(),
+            description: attempted.candidate.description.clone(),
+            confidence: attempted.candidate.confidence.as_str().to_string(),
+            verified: attempted.verified,
+            rejected_reason: attempted.rejected_reason.clone(),
+        })
+        .collect();
 
-    let mut attempts: u32 = 0;
-    let mut verified = false;
-    let mut workspace_applied: Vec<repair::RepairCandidate> = Vec::new();
-    let mut final_verification: Option<verification::VerificationResult> = None;
-    let mut pending_errors = errors.clone();
+    let verified_candidate = report.applied.first();
 
-    while attempts < MAX_REPAIR_ATTEMPTS {
-        let candidates = candidate_repairs(&pending_errors, &history);
+    for candidate in &report.applied {
+        fixer::apply_patches(&candidate.patch, project_dir)?;
+    }
 
-        if candidates.is_empty() {
-            break;
-        }
+    if json {
+        let verification = report
+            .final_verification
+            .as_ref()
+            .map(|result| JsonVerification {
+                mode: verify_mode.as_str().to_string(),
+                command: result.command.clone(),
+                passed: report.is_verified(),
+                attempts: report.attempts,
+                duration_ms: result.duration_ms,
+                applied: report
+                    .applied
+                    .iter()
+                    .map(|candidate| JsonAppliedStep {
+                        kind: candidate.kind.as_str().to_string(),
+                        description: candidate.description.clone(),
+                        patch: candidate.patch.edits.iter().map(JsonEdit::from).collect(),
+                    })
+                    .collect(),
+                tried: tried_candidates,
+            });
 
-        let candidate = &candidates[0];
-        attempts += 1;
-        history.record_patch(&candidate.patch);
+        return emit_fix_json(
+            status.as_str(),
+            &report.errors,
+            &report.proposed,
+            &report.attempted,
+            false,
+            verification,
+            report.attempts,
+        );
+    }
 
-        if !json {
-            println!();
+    match status {
+        engine::RepairStatus::RepairAttempted => {
             println!(
-                "  {}. [{}] {} (confidence: {})",
-                attempts,
-                candidate.kind.as_str(),
-                candidate.description,
-                candidate.confidence.as_str()
+                "{} No candidate passed verification in isolation; original project left untouched.",
+                "⚠".yellow().bold()
             );
         }
-
-        if !candidate.patch.edits.is_empty() {
-            if let Err(err) = candidate.patch.validate(workspace.path().to_str().unwrap()) {
-                if !json {
-                    println!(
-                        "  {} Candidate {} invalid on isolated copy: {}",
-                        "✖".red(),
-                        candidate.kind.as_str(),
-                        err
-                    );
-                }
-                continue;
+        engine::RepairStatus::MultipleVerifiedRepairs => {
+            println!(
+                "{} Multiple verified repairs found ({}); human selection required. No patch applied automatically.",
+                "⚠".yellow().bold(),
+                report.verified_alternatives.len() + 1
+            );
+            if let Some(candidate) = report.applied.first() {
+                println!(
+                    "   • [{}] {} (confidence: {})",
+                    candidate.kind.as_str(),
+                    candidate.description,
+                    candidate.confidence.as_str()
+                );
             }
-
-            if let Err(err) = candidate.patch.apply(workspace.path().to_str().unwrap()) {
-                if !json {
-                    println!("  {} Could not apply candidate: {}", "✖".red(), err);
-                }
-                continue;
+            for candidate in &report.verified_alternatives {
+                println!(
+                    "   • [{}] {} (confidence: {})",
+                    candidate.kind.as_str(),
+                    candidate.description,
+                    candidate.confidence.as_str()
+                );
             }
-
-            workspace_applied.push(candidate.clone());
         }
-
-        let result = match verification::verify_in_workspace(&workspace, verify_mode) {
-            Ok(result) => result,
-            Err(err) => {
-                if !json {
-                    println!(
-                        "  {} Verification error for {}: {}",
-                        "✖".red(),
-                        candidate.kind.as_str(),
-                        err
-                    );
-                }
-                continue;
-            }
-        };
-
-        final_verification = Some(result.clone());
-
-        if result.passed {
-            verified = true;
-            if !json {
+        engine::RepairStatus::Verified => {
+            if let (Some(candidate), Some(result)) =
+                (report.applied.first(), report.final_verification.as_ref())
+            {
                 println!(
                     "  {} Verified repair: {} (`cargo {}` passed in {} ms).",
                     "✔".green().bold(),
@@ -454,81 +497,17 @@ fn fix_command(
                     result.duration_ms
                 );
             }
-            break;
-        }
-
-        if !json {
             println!(
-                "  {} Candidate {} failed `cargo {}` in isolation.",
-                "✖".red(),
-                candidate.kind.as_str(),
-                verify_mode.as_str()
+                "{} {} verified repair{} applied to the original project.",
+                "✔".green().bold(),
+                report.applied.len(),
+                if report.applied.len() == 1 { "" } else { "s" }
             );
         }
-
-        let combined = format!("{}\n{}", result.stdout, result.stderr);
-        let next_errors = parse_errors(&combined);
-
-        if next_errors.is_empty() {
-            break;
-        }
-
-        pending_errors = next_errors;
+        _ => {}
     }
 
-    if verified {
-        for candidate in &workspace_applied {
-            fixer::apply_patches(&candidate.patch, project_dir)?;
-        }
-    }
-
-    if json {
-        let verification = final_verification.map(|result| JsonVerification {
-            mode: verify_mode.as_str().to_string(),
-            command: result.command,
-            passed: verified,
-            attempts,
-            duration_ms: result.duration_ms,
-            applied: if verified {
-                workspace_applied
-                    .iter()
-                    .map(|candidate| JsonAppliedStep {
-                        kind: candidate.kind.as_str().to_string(),
-                        description: candidate.description.clone(),
-                        patch: candidate.patch.edits.iter().map(JsonEdit::from).collect(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-        });
-
-        let status = if verified {
-            "repair_applied"
-        } else {
-            "repair_attempted"
-        };
-
-        return emit_fix_json(status, &errors, &proposed, false, verification, attempts);
-    }
-
-    if !verified {
-        println!(
-            "{} No candidate passed verification in isolation; original project left untouched.",
-            "⚠".yellow().bold()
-        );
-    } else {
-        println!(
-            "{} {} verified repair{} applied to the original project.",
-            "✔".green().bold(),
-            workspace_applied.len(),
-            if workspace_applied.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
-    }
+    let _ = verified_candidate;
 
     println!(
         "{}",
@@ -562,6 +541,8 @@ struct JsonFixCandidate {
     description: String,
     evidence: Vec<String>,
     patch: Vec<JsonEdit>,
+    verified: Option<bool>,
+    rejected_reason: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -581,6 +562,16 @@ struct JsonVerification {
     attempts: u32,
     duration_ms: u128,
     applied: Vec<JsonAppliedStep>,
+    tried: Vec<JsonTriedCandidate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct JsonTriedCandidate {
+    kind: String,
+    description: String,
+    confidence: String,
+    verified: bool,
+    rejected_reason: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -606,6 +597,7 @@ fn fix_json_report(
     status: &str,
     errors: &[ParsedError],
     candidates: &[repair::RepairCandidate],
+    attempted: &[engine::AttemptedCandidate],
     dry_run: bool,
     verification: Option<JsonVerification>,
     attempts: u32,
@@ -633,14 +625,36 @@ fn fix_json_report(
         })
         .collect();
 
+    let attempted_by_signature: std::collections::HashMap<String, (bool, Option<String>)> =
+        attempted
+            .iter()
+            .map(|item| {
+                (
+                    repair::patch_signature(&item.candidate.patch),
+                    (item.verified, item.rejected_reason.clone()),
+                )
+            })
+            .collect();
+
     let candidates = candidates
         .iter()
-        .map(|candidate| JsonFixCandidate {
-            kind: candidate.kind.as_str().to_string(),
-            confidence: candidate.confidence.as_str().to_string(),
-            description: candidate.description.clone(),
-            evidence: candidate.evidence.clone(),
-            patch: candidate.patch.edits.iter().map(JsonEdit::from).collect(),
+        .map(|candidate| {
+            let signature = repair::patch_signature(&candidate.patch);
+            let (verified, rejected_reason) = attempted_by_signature
+                .get(&signature)
+                .cloned()
+                .map(|(verified, reason)| (Some(verified), reason))
+                .unwrap_or((None, None));
+
+            JsonFixCandidate {
+                kind: candidate.kind.as_str().to_string(),
+                confidence: candidate.confidence.as_str().to_string(),
+                description: candidate.description.clone(),
+                evidence: candidate.evidence.clone(),
+                patch: candidate.patch.edits.iter().map(JsonEdit::from).collect(),
+                verified,
+                rejected_reason,
+            }
         })
         .collect();
 
@@ -652,30 +666,6 @@ fn fix_json_report(
         attempts,
         dry_run,
     }
-}
-
-fn parse_errors(output: &str) -> Vec<ParsedError> {
-    let mut errors = Vec::new();
-
-    for line in output.lines() {
-        let Ok(message) = serde_json::from_str::<diagnostics::CargoMessage>(line) else {
-            continue;
-        };
-
-        if message.reason != "compiler-message" {
-            continue;
-        }
-
-        let Some(rustc_message) = message.message else {
-            continue;
-        };
-
-        if let Some(error) = ParsedError::from_rustc_message(&rustc_message) {
-            errors.push(error);
-        }
-    }
-
-    errors
 }
 
 fn print_json_report(errors: &[ParsedError]) -> Result<()> {

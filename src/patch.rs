@@ -10,6 +10,10 @@ pub struct Edit {
     pub end_col: u32,
     pub replacement: String,
     pub label: Option<String>,
+    /// The trimmed source line the edit was computed against. When present, an
+    /// apply/validate is refused if the current line differs (the patch became
+    /// stale because the file changed after the repair was generated).
+    pub anchor: Option<String>,
 }
 
 impl Edit {
@@ -28,6 +32,7 @@ impl Edit {
             end_col,
             replacement: replacement.into(),
             label: None,
+            anchor: None,
         }
     }
 
@@ -121,6 +126,20 @@ fn validate_edit(edit: &Edit, source: &str) -> anyhow::Result<()> {
         .lines()
         .nth((edit.line.saturating_sub(1)) as usize)
         .ok_or_else(|| anyhow::anyhow!("edit line {} out of range", edit.line))?;
+
+    if let Some(expected) = &edit.anchor {
+        let actual = line.trim();
+        if actual != expected {
+            anyhow::bail!(
+                "stale patch: line {} of {} changed since the repair was generated \
+                 (expected {:?}, found {:?}); refusing to apply",
+                edit.line,
+                edit.file,
+                expected,
+                actual
+            );
+        }
+    }
 
     let start = char_column_to_byte(line, edit.start_col)?;
     let end = char_column_to_byte(line, edit.end_col)?;
@@ -321,8 +340,7 @@ mod tests {
 
         let err = patch
             .validate(temp_dir.to_str().unwrap())
-            .err()
-            .expect("should fail");
+            .expect_err("should fail");
 
         assert!(err.to_string().contains("out of range"));
 
@@ -339,5 +357,80 @@ mod tests {
 
         assert!(preview.contains("src/main.rs"));
         assert!(preview.contains("+mut "));
+    }
+
+    #[test]
+    fn apply_rejects_stale_patch_when_line_changed() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rxplain_patch_stale_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::create_dir_all(temp_dir.join("src")).unwrap();
+        std::fs::write(
+            temp_dir.join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n    x += 1;\n}\n",
+        )
+        .unwrap();
+
+        let mut edit = Edit::new("src/main.rs", 2, 9, 9, "mut ");
+        edit.anchor = Some("let x = 1;".to_string());
+
+        let patch = Patch::new(vec![edit]);
+
+        // File is unchanged: validate and apply both succeed.
+        patch.validate(temp_dir.to_str().unwrap()).unwrap();
+        patch.apply(temp_dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.join("src/main.rs")).unwrap(),
+            "fn main() {\n    let mut x = 1;\n    x += 1;\n}\n"
+        );
+
+        // Mutate the target line after generation: the patch is now stale.
+        let mut edit = Edit::new("src/main.rs", 2, 9, 9, "mut ");
+        edit.anchor = Some("let x = 1;".to_string());
+        let stale_patch = Patch::new(vec![edit]);
+        std::fs::write(
+            temp_dir.join("src/main.rs"),
+            "fn main() {\n    let y = 2;\n    x += 1;\n}\n",
+        )
+        .unwrap();
+
+        let err = stale_patch
+            .validate(temp_dir.to_str().unwrap())
+            .expect_err("stale patch must be rejected");
+        assert!(
+            err.to_string().contains("stale patch"),
+            "error must identify the patch as stale: {err}"
+        );
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn apply_succeeds_when_no_anchor_present() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rxplain_patch_no_anchor_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        std::fs::create_dir_all(temp_dir.join("src")).unwrap();
+        std::fs::write(temp_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        // Hand-built edits carry no anchor, so no staleness gate applies.
+        let edit = Edit::new("src/main.rs", 1, 1, 1, "// hi\n");
+        let patch = Patch::new(vec![edit]);
+
+        patch.apply(temp_dir.to_str().unwrap()).unwrap();
+
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 }

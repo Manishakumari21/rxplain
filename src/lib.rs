@@ -5,5 +5,7 @@ pub mod explain;
 pub mod fixer;
 pub mod patch;
 pub mod repair;
+pub mod repair_context;
 pub mod runner;
+pub mod transform;
 pub mod verification;

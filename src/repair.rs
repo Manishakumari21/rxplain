@@ -87,6 +87,7 @@ pub fn rank_candidates(candidates: Vec<RepairCandidate>) -> Vec<RepairCandidate>
     candidates
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn candidates_for_error(error: &ParsedError) -> Vec<RepairCandidate> {
     let mut candidates = Vec::new();
 
@@ -122,6 +123,7 @@ pub fn candidates_for_error(error: &ParsedError) -> Vec<RepairCandidate> {
                 end_col: suggestion.column_end,
                 replacement: suggestion.replacement.clone(),
                 label: suggestion.label.clone(),
+                anchor: None,
             }]),
         });
     }
@@ -133,6 +135,7 @@ pub fn candidates_for_error(error: &ParsedError) -> Vec<RepairCandidate> {
     candidates
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn moved_value_candidates(error: &ParsedError, candidates: &mut Vec<RepairCandidate>) {
     if !error.suggestions.is_empty() {
         return;
@@ -243,6 +246,7 @@ mod tests {
                 applicability: "MachineApplicable".to_string(),
                 label: Some("change to mutable".to_string()),
             }],
+            ..Default::default()
         };
 
         let candidates = candidates_for_error(&error);
@@ -260,6 +264,7 @@ mod tests {
             raw_message: "use of moved value".to_string(),
             spans: Vec::new(),
             suggestions: Vec::new(),
+            ..Default::default()
         };
 
         let candidates = candidates_for_error(&error);

@@ -40,6 +40,7 @@ pub struct VerificationResult {
 
 pub struct IsolatedWorkspace {
     dir: PathBuf,
+    source_dir: PathBuf,
 }
 
 const KEEP_DIRS: &[&str] = &["target", ".git", ".hg", ".svn"];
@@ -58,13 +59,32 @@ impl IsolatedWorkspace {
         let dest =
             std::env::temp_dir().join(format!("rxplain_ws_{}_{}", std::process::id(), stamp));
 
+        let dest_buf = dest.clone();
         Self::copy_project(source, &dest)?;
 
-        Ok(Self { dir: dest })
+        Ok(Self {
+            dir: dest_buf,
+            source_dir: source.to_path_buf(),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// Discard any patches applied during previous verification attempts and
+    /// restore a pristine copy of the original project.
+    pub fn reset(&self) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Self::copy_project(&self.source_dir, &self.dir)
     }
 
     fn copy_project(src: &Path, dest: &Path) -> anyhow::Result<()> {

@@ -135,8 +135,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 30"]);
         let err = run_command_with_timeout(&mut command, Duration::from_millis(500), "sleep")
-            .err()
-            .expect("long-running child must time out");
+            .expect_err("long-running child must time out");
         assert!(err.to_string().contains("timeout"));
     }
 }
