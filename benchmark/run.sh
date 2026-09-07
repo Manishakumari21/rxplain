@@ -80,12 +80,12 @@ for case_dir in "$CASES_DIR"/*; do
     cp -r "$case_dir" "$case_copy"
     rm -rf "$case_copy/target"
 
-    FIX_OUTPUT="$("$RXPLAIN" "$case_copy" --fix 2>&1 || true)"
+    FIX_OUTPUT="$("$RXPLAIN" --fix "$case_copy" 2>&1 || true)"
 
-    if echo "$FIX_OUTPUT" | grep -q "compiles successfully"; then
+    if echo "$FIX_OUTPUT" | grep -q "Verified repair"; then
         echo "  Verified fix  ✓"
         FIX_VERIFIED=$((FIX_VERIFIED + 1))
-    elif echo "$FIX_OUTPUT" | grep -q "No automatic fix was applied"; then
+    elif echo "$FIX_OUTPUT" | grep -q "human judgment"; then
         echo "  Verified fix  — (no safe fix)"
     else
         echo "  Verified fix  ✗"

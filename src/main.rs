@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use colored::*;
 use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
 use serde::Serialize;
@@ -10,8 +10,11 @@ mod context;
 mod diagnostics;
 mod explain;
 mod fixer;
+mod patch;
+mod repair;
 mod runner;
 mod tui;
+mod verification;
 mod walk;
 
 use diagnostics::ParsedError;
@@ -23,44 +26,28 @@ use diagnostics::ParsedError;
     about = "A deterministic, offline explainer for Rust compiler errors"
 )]
 struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
+    project_dir: String,
 
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Check whether a Rust project compiles
-    Check {
-        #[arg(default_value = ".")]
-        project_dir: String,
-    },
+    #[arg(long)]
+    fix: bool,
 
-    /// Explain Rust compiler errors
-    Explain {
-        #[arg(default_value = ".")]
-        project_dir: String,
+    #[arg(long, requires = "fix", value_name = "MODE")]
+    verify: Option<String>,
 
-        #[arg(long)]
-        json: bool,
+    #[arg(long, requires = "fix")]
+    dry_run: bool,
 
-        #[arg(long)]
-        walk: bool,
+    #[arg(long)]
+    json: bool,
 
-        #[arg(long)]
-        tui: bool,
+    #[arg(long)]
+    walk: bool,
 
-        #[arg(long)]
-        quiet: bool,
-    },
+    #[arg(long)]
+    tui: bool,
 
-    /// Safely apply compiler-suggested fixes
-    Fix {
-        #[arg(default_value = ".")]
-        project_dir: String,
-
-        #[arg(long)]
-        dry_run: bool,
-    },
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,235 +105,429 @@ struct JsonFix {
     applicability: Option<String>,
 }
 
+const BANNER: &str = r#"
+   ██████╗ ██╗  ██╗██████╗ ██╗      █████╗ ██╗███╗   ██╗
+   ██╔══██╗╚██╗██╔╝██╔══██╗██║     ██╔══██╗██║████╗  ██║
+   ██████╔╝ ╚███╔╝ ██████╔╝██║     ███████║██║██╔██╗ ██║
+   ██╔══██╗ ██╔██╗ ██╔═══╝ ██║     ██╔══██║██║██║╚██╗██║
+   ██║  ██║██╔╝ ██╗██║     ███████╗██║  ██║██║██║ ╚████║
+   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝
+"#;
+
+fn print_banner() {
+    println!();
+    for (index, line) in BANNER.lines().enumerate() {
+        let color = match index {
+            0 | 4 => Color::BrightRed,
+            1 | 3 => Color::BrightYellow,
+            _ => Color::BrightCyan,
+        };
+        println!("{}", line.color(color));
+    }
+    println!(
+        "{} {}\n",
+        "✦".yellow(),
+        "Rust error, explained. — deterministic · offline · safe fixes"
+            .white()
+            .italic()
+    );
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
-        Command::Check { project_dir } => check_command(&project_dir),
+    if cli.fix {
+        let verify_mode = cli
+            .verify
+            .as_deref()
+            .map(parse_verify_mode)
+            .transpose()?
+            .unwrap_or(verification::VerifyMode::Check);
 
-        Command::Explain {
-            project_dir,
-            json,
-            walk,
-            tui,
-            quiet,
-        } => explain_command(&project_dir, json, walk, tui, quiet),
-
-        Command::Fix {
-            project_dir,
-            dry_run,
-        } => fix_command(&project_dir, dry_run),
-    }
-}
-
-fn check_command(project_dir: &str) -> Result<()> {
-    let started = Instant::now();
-
-    let output = runner::run_cargo_build(project_dir)?;
-    let errors = parse_errors(&output);
-
-    let elapsed = started.elapsed();
-
-    if errors.is_empty() {
-        println!(
-            "{} Rust project compiles successfully. {}",
-            "✔".green().bold(),
-            format!("({})", HumanDuration(elapsed)).dimmed()
-        );
-    } else {
-        println!(
-            "{} {} compiler error{} found. {}",
-            "✖".red().bold(),
-            errors.len(),
-            if errors.len() == 1 { "" } else { "s" },
-            format!("({})", HumanDuration(elapsed)).dimmed()
-        );
-
-        for error in &errors {
-            println!(
-                "  {} {}: {}",
-                "→".red(),
-                error.code.red().bold(),
-                error.raw_message
-            );
-        }
-
-        println!();
-        println!(
-            "Run {} for detailed explanations.",
-            "rxplain explain".cyan().bold()
-        );
+        return fix_command(&cli.project_dir, cli.dry_run, cli.json, verify_mode);
     }
 
-    Ok(())
-}
+    if !cli.json && !cli.tui && !cli.quiet {
+        print_banner();
+    }
 
-fn explain_command(
-    project_dir: &str,
-    json: bool,
-    walk: bool,
-    tui: bool,
-    quiet: bool,
-) -> Result<()> {
     let started = Instant::now();
 
-    let output = if json || tui {
-        runner::run_cargo_build(project_dir)?
-    } else if quiet {
-        runner::run_cargo_build(project_dir)?
+    let output = if cli.json || cli.tui {
+        runner::run_cargo_build(&cli.project_dir)?
     } else {
         let spinner = ProgressBar::new_spinner();
-
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_strings(&["▖", "▘", "▝", "▗", "▖", "▘", "▝", "▗"])
                 .template("{spinner:.yellow} {msg}")
                 .unwrap(),
         );
-
-        spinner.set_message(format!("Analyzing {}...", project_dir));
-
-        let result = runner::run_cargo_build(project_dir);
-
+        spinner.set_message(format!("Analyzing {}...", cli.project_dir));
+        let result = runner::run_cargo_build(&cli.project_dir);
         spinner.finish_and_clear();
-
         result?
     };
 
     let errors = parse_errors(&output);
 
-    let cli = Cli {
-        command: Command::Explain {
-            project_dir: project_dir.to_string(),
-            json,
-            walk,
-            tui,
-            quiet,
-        },
-    };
+    let project_dir = cli.project_dir.clone();
 
-    if json {
+    if cli.json {
         print_json_report(&errors)?;
-    } else if walk {
-        walk::walk_errors(&errors, project_dir);
-    } else if tui {
+    } else if cli.walk {
+        walk::walk_errors(&errors, &project_dir);
+    } else if cli.tui {
         if std::io::IsTerminal::is_terminal(&std::io::stdout())
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
         {
-            crate::tui::run(&errors, project_dir)?;
+            crate::tui::run(&errors, &project_dir)?;
         } else {
             eprintln!(
                 "note: --tui requires an interactive terminal, \
                  falling back to plain output"
             );
 
-            print_human_report(&errors, &cli, started);
+            print_human_report(&errors, &project_dir, started);
         }
     } else {
-        print_human_report(&errors, &cli, started);
+        print_human_report(&errors, &project_dir, started);
     }
 
     Ok(())
 }
 
-fn fix_command(project_dir: &str, dry_run: bool) -> Result<()> {
+const MAX_REPAIR_ATTEMPTS: u32 = 4;
+
+fn parse_verify_mode(mode: &str) -> Result<verification::VerifyMode> {
+    match mode {
+        "check" => Ok(verification::VerifyMode::Check),
+        "build" => Ok(verification::VerifyMode::Build),
+        "test" => Ok(verification::VerifyMode::Test),
+        other => {
+            anyhow::bail!("invalid --verify mode `{other}`: expected `check`, `build`, or `test`")
+        }
+    }
+}
+
+fn candidate_repairs(
+    errors: &[ParsedError],
+    history: &repair::RepairHistory,
+) -> Vec<repair::RepairCandidate> {
+    let mut candidates: Vec<repair::RepairCandidate> = Vec::new();
+
+    for error in errors {
+        candidates.extend(repair::candidates_for_error(error));
+    }
+
+    candidates = repair::rank_candidates(candidates);
+
+    candidates
+        .into_iter()
+        .filter(|candidate| !history.contains(&candidate.patch))
+        .collect()
+}
+
+fn print_candidates(candidates: &[repair::RepairCandidate], with_preview: bool) {
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!();
+        println!(
+            "  {}. [{}] {} (confidence: {})",
+            index + 1,
+            candidate.kind.as_str(),
+            candidate.description,
+            candidate.confidence.as_str()
+        );
+
+        for evidence in &candidate.evidence {
+            println!("     • {}", evidence.dimmed());
+        }
+
+        if with_preview && !candidate.patch.edits.is_empty() {
+            for line in candidate.patch.preview().lines() {
+                println!("       {}", line.bright_black());
+            }
+        }
+    }
+}
+
+fn emit_fix_json(
+    status: &str,
+    errors: &[ParsedError],
+    candidates: &[repair::RepairCandidate],
+    dry_run: bool,
+    verification: Option<JsonVerification>,
+    attempts: u32,
+) -> Result<()> {
+    let report = fix_json_report(status, errors, candidates, dry_run, verification, attempts);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn fix_command(
+    project_dir: &str,
+    dry_run: bool,
+    json: bool,
+    verify_mode: verification::VerifyMode,
+) -> Result<()> {
     let started = Instant::now();
+
+    if !json {
+        print_banner();
+    }
 
     let output = runner::run_cargo_build(project_dir)?;
     let errors = parse_errors(&output);
 
     if errors.is_empty() {
-        println!(
-            "{} No compiler errors found. Nothing to fix.",
-            "✔".green().bold()
-        );
+        if json {
+            emit_fix_json("nothing_to_repair", &errors, &[], dry_run, None, 0)?;
+        } else {
+            println!(
+                "{} No compiler errors found. Nothing to fix.",
+                "✔".green().bold()
+            );
+        }
         return Ok(());
     }
 
-    let mut suggestions = Vec::new();
-
-    for error in &errors {
-        for suggestion in &error.suggestions {
-            if suggestion.applicability == "MachineApplicable" {
-                suggestions.push(suggestion.clone());
+    match verification::reproduce_failure(project_dir, verify_mode) {
+        Ok(true) => {}
+        Ok(false) => {
+            if json {
+                emit_fix_json("nothing_to_repair", &errors, &[], dry_run, None, 0)?;
+            } else {
+                println!(
+                    "{} Project passes `cargo {}` in isolation; nothing to repair.",
+                    "✔".green().bold(),
+                    verify_mode.as_str()
+                );
+            }
+            return Ok(());
+        }
+        Err(err) => {
+            if json {
+                emit_fix_json("isolation_check_failed", &errors, &[], dry_run, None, 0)?;
+            } else {
+                println!("  {} Isolation check failed: {}", "⚠".yellow(), err);
             }
         }
     }
 
-    if suggestions.is_empty() {
-        println!(
-            "{} No safe compiler-suggested fixes were found.",
-            "⚠".yellow().bold()
-        );
-
-        println!("  The remaining errors require human judgment.");
-
-        return Ok(());
-    }
-
-    println!(
-        "{} {} safe fix{} found.",
-        "🔧".cyan(),
-        suggestions.len(),
-        if suggestions.len() == 1 { "" } else { "es" }
-    );
-
-    for suggestion in &suggestions {
-        println!();
-        println!(
-            "  {} {}:{}:{}",
-            "→".cyan(),
-            suggestion.file,
-            suggestion.line,
-            suggestion.column
-        );
-
-        println!(
-            "    {} {}",
-            "Replacement:".dimmed(),
-            suggestion.replacement.green()
-        );
-
-        if let Some(label) = &suggestion.label {
-            println!("    {} {}", "Reason:".dimmed(), label.dimmed());
-        }
-
-        println!(
-            "    {} {}",
-            "Safety:".dimmed(),
-            suggestion.applicability.green()
-        );
-    }
+    let mut history = repair::RepairHistory::new();
+    let proposed = candidate_repairs(&errors, &history);
 
     if dry_run {
-        println!();
-        println!("{} Dry run — no files were modified.", "ℹ".cyan().bold());
-
+        if json {
+            emit_fix_json("preview", &errors, &proposed, true, None, 0)?;
+        } else {
+            println!();
+            println!(
+                "{} {} candidate repair{} generated (most confident first).",
+                "🔧".cyan(),
+                proposed.len(),
+                if proposed.len() == 1 { "" } else { "s" }
+            );
+            print_candidates(&proposed, true);
+            println!();
+            println!("{} Dry run — no files were modified.", "ℹ".cyan().bold());
+            println!(
+                "{}",
+                format!("Completed in {}", HumanDuration(started.elapsed())).dimmed()
+            );
+        }
         return Ok(());
     }
 
-    println!();
-    println!("{} Applying safe compiler suggestions...", "⏳".yellow());
+    if proposed.is_empty() {
+        if json {
+            emit_fix_json("human_review_required", &errors, &proposed, false, None, 0)?;
+        } else {
+            println!();
+            println!(
+                "{} No safely expressible candidate repair was found.",
+                "⚠".yellow().bold()
+            );
+            println!("  The remaining errors require human judgment.");
+        }
+        return Ok(());
+    }
 
-    fixer::apply_fixes(&suggestions, project_dir)?;
+    if !json {
+        println!();
+        println!(
+            "{} {} candidate repair{} generated (most confident first).",
+            "🔧".cyan(),
+            proposed.len(),
+            if proposed.len() == 1 { "" } else { "s" }
+        );
+        print_candidates(&proposed, false);
+        println!();
+        println!(
+            "{} Verifying candidates with `cargo {}` in an isolated workspace...",
+            "⏳".yellow(),
+            verify_mode.as_str()
+        );
+    }
 
-    println!("{} Fixes applied successfully.", "✔".green().bold());
+    let workspace = match verification::IsolatedWorkspace::create(project_dir) {
+        Ok(ws) => ws,
+        Err(err) => anyhow::bail!("could not create isolated workspace: {}", err),
+    };
 
-    println!("{} Verifying project...", "⏳".yellow());
+    let mut attempts: u32 = 0;
+    let mut verified = false;
+    let mut workspace_applied: Vec<repair::RepairCandidate> = Vec::new();
+    let mut final_verification: Option<verification::VerificationResult> = None;
+    let mut pending_errors = errors.clone();
 
-    match runner::verify_build(project_dir)? {
-        true => {
-            println!("{} Project now compiles successfully.", "✔".green().bold());
+    while attempts < MAX_REPAIR_ATTEMPTS {
+        let candidates = candidate_repairs(&pending_errors, &history);
+
+        if candidates.is_empty() {
+            break;
         }
 
-        false => {
-            println!("{} Project still has compiler errors.", "✖".red().bold());
+        let candidate = &candidates[0];
+        attempts += 1;
+        history.record_patch(&candidate.patch);
 
+        if !json {
+            println!();
             println!(
-                "  Run {} to inspect the remaining errors.",
-                "rxplain explain".cyan()
+                "  {}. [{}] {} (confidence: {})",
+                attempts,
+                candidate.kind.as_str(),
+                candidate.description,
+                candidate.confidence.as_str()
             );
         }
+
+        if !candidate.patch.edits.is_empty() {
+            if let Err(err) = candidate.patch.validate(workspace.path().to_str().unwrap()) {
+                if !json {
+                    println!(
+                        "  {} Candidate {} invalid on isolated copy: {}",
+                        "✖".red(),
+                        candidate.kind.as_str(),
+                        err
+                    );
+                }
+                continue;
+            }
+
+            if let Err(err) = candidate.patch.apply(workspace.path().to_str().unwrap()) {
+                if !json {
+                    println!("  {} Could not apply candidate: {}", "✖".red(), err);
+                }
+                continue;
+            }
+
+            workspace_applied.push(candidate.clone());
+        }
+
+        let result = match verification::verify_in_workspace(&workspace, verify_mode) {
+            Ok(result) => result,
+            Err(err) => {
+                if !json {
+                    println!(
+                        "  {} Verification error for {}: {}",
+                        "✖".red(),
+                        candidate.kind.as_str(),
+                        err
+                    );
+                }
+                continue;
+            }
+        };
+
+        final_verification = Some(result.clone());
+
+        if result.passed {
+            verified = true;
+            if !json {
+                println!(
+                    "  {} Verified repair: {} (`cargo {}` passed in {} ms).",
+                    "✔".green().bold(),
+                    candidate.kind.as_str(),
+                    verify_mode.as_str(),
+                    result.duration_ms
+                );
+            }
+            break;
+        }
+
+        if !json {
+            println!(
+                "  {} Candidate {} failed `cargo {}` in isolation.",
+                "✖".red(),
+                candidate.kind.as_str(),
+                verify_mode.as_str()
+            );
+        }
+
+        let combined = format!("{}\n{}", result.stdout, result.stderr);
+        let next_errors = parse_errors(&combined);
+
+        if next_errors.is_empty() {
+            break;
+        }
+
+        pending_errors = next_errors;
+    }
+
+    if verified {
+        for candidate in &workspace_applied {
+            fixer::apply_patches(&candidate.patch, project_dir)?;
+        }
+    }
+
+    if json {
+        let verification = final_verification.map(|result| JsonVerification {
+            mode: verify_mode.as_str().to_string(),
+            command: result.command,
+            passed: verified,
+            attempts,
+            duration_ms: result.duration_ms,
+            applied: if verified {
+                workspace_applied
+                    .iter()
+                    .map(|candidate| JsonAppliedStep {
+                        kind: candidate.kind.as_str().to_string(),
+                        description: candidate.description.clone(),
+                        patch: candidate.patch.edits.iter().map(JsonEdit::from).collect(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        });
+
+        let status = if verified {
+            "repair_applied"
+        } else {
+            "repair_attempted"
+        };
+
+        return emit_fix_json(status, &errors, &proposed, false, verification, attempts);
+    }
+
+    if !verified {
+        println!(
+            "{} No candidate passed verification in isolation; original project left untouched.",
+            "⚠".yellow().bold()
+        );
+    } else {
+        println!(
+            "{} {} verified repair{} applied to the original project.",
+            "✔".green().bold(),
+            workspace_applied.len(),
+            if workspace_applied.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
     }
 
     println!(
@@ -355,6 +536,122 @@ fn fix_command(project_dir: &str, dry_run: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JsonFixReport {
+    status: String,
+    diagnostics: Vec<JsonFixDiagnostic>,
+    candidates: Vec<JsonFixCandidate>,
+    verification: Option<JsonVerification>,
+    attempts: u32,
+    dry_run: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JsonFixDiagnostic {
+    code: String,
+    message: String,
+    locations: Vec<JsonLocation>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JsonFixCandidate {
+    kind: String,
+    confidence: String,
+    description: String,
+    evidence: Vec<String>,
+    patch: Vec<JsonEdit>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JsonEdit {
+    file: String,
+    line: u32,
+    start_col: u32,
+    end_col: u32,
+    replacement: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JsonVerification {
+    mode: String,
+    command: String,
+    passed: bool,
+    attempts: u32,
+    duration_ms: u128,
+    applied: Vec<JsonAppliedStep>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JsonAppliedStep {
+    kind: String,
+    description: String,
+    patch: Vec<JsonEdit>,
+}
+
+impl From<&patch::Edit> for JsonEdit {
+    fn from(edit: &patch::Edit) -> Self {
+        JsonEdit {
+            file: edit.file.clone(),
+            line: edit.line,
+            start_col: edit.start_col,
+            end_col: edit.end_col,
+            replacement: edit.replacement.clone(),
+        }
+    }
+}
+
+fn fix_json_report(
+    status: &str,
+    errors: &[ParsedError],
+    candidates: &[repair::RepairCandidate],
+    dry_run: bool,
+    verification: Option<JsonVerification>,
+    attempts: u32,
+) -> JsonFixReport {
+    let diagnostics = errors
+        .iter()
+        .map(|error| JsonFixDiagnostic {
+            code: error.code.clone(),
+            message: error.raw_message.clone(),
+            locations: error
+                .spans
+                .iter()
+                .map(|span| JsonLocation {
+                    file: span.file_name.clone(),
+                    line: span.line_start,
+                    column: span.column_start,
+                    snippet: span
+                        .text
+                        .first()
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default(),
+                    label: span.label.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let candidates = candidates
+        .iter()
+        .map(|candidate| JsonFixCandidate {
+            kind: candidate.kind.as_str().to_string(),
+            confidence: candidate.confidence.as_str().to_string(),
+            description: candidate.description.clone(),
+            evidence: candidate.evidence.clone(),
+            patch: candidate.patch.edits.iter().map(JsonEdit::from).collect(),
+        })
+        .collect();
+
+    JsonFixReport {
+        status: status.to_string(),
+        diagnostics,
+        candidates,
+        verification,
+        attempts,
+        dry_run,
+    }
 }
 
 fn parse_errors(output: &str) -> Vec<ParsedError> {
@@ -482,7 +779,7 @@ fn print_json_report(errors: &[ParsedError]) -> Result<()> {
     Ok(())
 }
 
-fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
+fn print_human_report(errors: &[ParsedError], project_dir: &str, started: Instant) {
     let elapsed = started.elapsed();
 
     if errors.is_empty() {
@@ -598,7 +895,7 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
             }
         }
 
-        let contexts = context::SourceContext::from_error(error, &project_dir_from_cli(cli));
+        let contexts = context::SourceContext::from_error(error, project_dir);
 
         if !contexts.is_empty() {
             println!(
@@ -788,15 +1085,5 @@ fn print_human_report(errors: &[ParsedError], cli: &Cli, started: Instant) {
         println!("\n{}", format!("└{}┘", "─".repeat(58)).bright_black());
 
         println!();
-    }
-}
-
-fn project_dir_from_cli(cli: &Cli) -> String {
-    match &cli.command {
-        Command::Check { project_dir } => project_dir.clone(),
-
-        Command::Explain { project_dir, .. } => project_dir.clone(),
-
-        Command::Fix { project_dir, .. } => project_dir.clone(),
     }
 }

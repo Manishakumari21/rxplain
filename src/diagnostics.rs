@@ -75,6 +75,23 @@ impl ParsedError {
         let mut spans = msg.spans.clone();
         let mut suggestions = Vec::new();
 
+        for span in &spans {
+            if let Some(replacement) = &span.suggested_replacement {
+                suggestions.push(CompilerSuggestion {
+                    file: span.file_name.clone(),
+                    line: span.line_start,
+                    column: span.column_start,
+                    column_end: span.column_end,
+                    replacement: replacement.clone(),
+                    applicability: span
+                        .suggestion_applicability
+                        .clone()
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    label: span.label.clone(),
+                });
+            }
+        }
+
         for child in &msg.children {
             for span in &child.spans {
                 if let Some(replacement) = &span.suggested_replacement {

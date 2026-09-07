@@ -137,17 +137,43 @@ fn labels_by_line(spans: &[Span]) -> Vec<(u32, String)> {
 fn explain_moved_value(error: &ParsedError) -> Explanation {
     let labels = labels_by_line(&error.spans);
 
-    let summary = if labels.len() >= 2 {
-        format!(
-            "{}. {} (line {}), then {} (line {}).",
+    let (move_line, move_label) = labels
+        .iter()
+        .find(|(_, label)| {
+            label.contains("moved here")
+                || label.contains("move occurs")
+                || label.contains("value moved")
+        })
+        .map(|(line, label)| (*line, label.clone()))
+        .unwrap_or_else(|| {
+            labels
+                .first()
+                .map(|(line, label)| (*line, label.clone()))
+                .unwrap_or((0, error.raw_message.clone()))
+        });
+
+    let use_line = labels
+        .iter()
+        .find(|(line, label)| {
+            *line != move_line
+                && (label.contains("used here after move")
+                    || label.contains("borrowed here after move"))
+        })
+        .map(|(line, _)| *line);
+
+    let summary = match use_line {
+        Some(use_line) => format!(
+            "{}. The value is moved {} (line {}), then used again at line {}.",
+            error.raw_message, move_label, move_line, use_line
+        ),
+        None if labels.len() >= 2 => format!(
+            "{}. {} (line {}), then used at line {}.",
             error.raw_message,
-            labels[0].1,
-            labels[0].0,
-            labels[labels.len() - 1].1,
+            move_label,
+            move_line,
             labels[labels.len() - 1].0
-        )
-    } else {
-        error.raw_message.clone()
+        ),
+        None => format!("{}. {}", error.raw_message, move_label),
     };
 
     Explanation {

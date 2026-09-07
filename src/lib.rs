@@ -3,4 +3,7 @@ pub mod context;
 pub mod diagnostics;
 pub mod explain;
 pub mod fixer;
+pub mod patch;
+pub mod repair;
 pub mod runner;
+pub mod verification;

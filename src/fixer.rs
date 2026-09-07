@@ -1,4 +1,5 @@
 use crate::diagnostics::{CompilerSuggestion, ParsedError};
+use crate::patch::char_column_to_byte;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,10 @@ pub fn suggest_fix(err: &ParsedError) -> FixSuggestion {
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn apply_fix(suggestion: &CompilerSuggestion, project_dir: &str) -> anyhow::Result<()> {
     apply_fixes(std::slice::from_ref(suggestion), project_dir)
+}
+
+pub fn apply_patches(patch: &crate::patch::Patch, project_dir: &str) -> anyhow::Result<()> {
+    patch.apply(project_dir)
 }
 pub fn apply_fixes(suggestions: &[CompilerSuggestion], project_dir: &str) -> anyhow::Result<()> {
     let suggestions: Vec<&CompilerSuggestion> = suggestions
@@ -100,9 +105,10 @@ fn apply_to_source(path: &Path, suggestions: &[&CompilerSuggestion]) -> anyhow::
 
         let line = lines[line_index];
 
-        let start = suggestion.column.saturating_sub(1) as usize;
+        let start = char_column_to_byte(line, suggestion.column)?;
+        let end = char_column_to_byte(line, suggestion.column_end)?;
 
-        let end = suggestion.column_end.saturating_sub(1) as usize;
+        let both_noop = suggestion.column == suggestion.column_end && start == end;
 
         if start > end {
             anyhow::bail!(
@@ -114,18 +120,9 @@ fn apply_to_source(path: &Path, suggestions: &[&CompilerSuggestion]) -> anyhow::
             );
         }
 
-        if start > line.len() {
+        if start > line.len() || (end > line.len() && !both_noop) {
             anyhow::bail!(
-                "Fix start column is outside the source line: {}:{}:{}",
-                suggestion.file,
-                suggestion.line,
-                suggestion.column
-            );
-        }
-
-        if end > line.len() {
-            anyhow::bail!(
-                "Fix end column is outside the source line: {}:{}:{}-{}",
+                "Fix column is outside the source line: {}:{}:{}-{}",
                 suggestion.file,
                 suggestion.line,
                 suggestion.column,
@@ -227,6 +224,42 @@ mod tests {
         assert_eq!(
             result,
             "fn main() {\n    let name = \"Manisha\".to_string();\n}\n"
+        );
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn applies_fix_correctly_on_non_ascii_source() {
+        let temp_dir = std::env::temp_dir().join("rxplain_fixer_unicode_test");
+
+        fs::create_dir_all(temp_dir.join("src")).unwrap();
+
+        let file = temp_dir.join("src/main.rs");
+
+        fs::write(
+            &file,
+            "fn main() {\n    let 名前 = \"hi\";\n    println!(\"{}\", 名前);\n}\n",
+        )
+        .unwrap();
+
+        let suggestion = CompilerSuggestion {
+            file: "src/main.rs".to_string(),
+            line: 2,
+            column: 18,
+            column_end: 18,
+            replacement: ".to_string()".to_string(),
+            applicability: "MachineApplicable".to_string(),
+            label: Some("convert to String".to_string()),
+        };
+
+        apply_fix(&suggestion, temp_dir.to_str().unwrap()).unwrap();
+
+        let result = fs::read_to_string(&file).unwrap();
+
+        assert_eq!(
+            result,
+            "fn main() {\n    let 名前 = \"hi\".to_string();\n    println!(\"{}\", 名前);\n}\n"
         );
 
         fs::remove_dir_all(temp_dir).ok();

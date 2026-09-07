@@ -48,31 +48,31 @@ const MUTABLE: &str = "fn main() {\n    let x = 1;\n    x += 1;\n    println!(\"
 
 #[test]
 fn check_succeeds_on_engine_repository() {
-    let output = run(&["check"], Path::new(MANIFEST_DIR));
+    let output = run(&[MANIFEST_DIR], Path::new(MANIFEST_DIR));
 
     assert!(
         output.status.success(),
         "expected success, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout(&output).contains("compiles successfully"));
+    assert!(stdout(&output).contains("No compiler errors found"));
 }
 
 #[test]
 fn explain_succeeds_on_engine_repository() {
-    let output = run(&["explain"], Path::new(MANIFEST_DIR));
+    let output = run(&[MANIFEST_DIR], Path::new(MANIFEST_DIR));
 
     assert!(output.status.success());
     assert!(stdout(&output).contains("No compiler errors found"));
 }
 
 #[test]
-fn check_detects_errors_in_external_project() {
+fn explain_detects_errors_in_external_project() {
     let project = temp_dir("check_external");
     write_project(&project, MISMATCHED);
 
     let arg = project.to_str().unwrap();
-    let output = run(&["check", arg], &project);
+    let output = run(&[arg], &project);
 
     assert!(
         output.status.success(),
@@ -81,7 +81,7 @@ fn check_detects_errors_in_external_project() {
     );
 
     let out = stdout(&output);
-    assert!(out.contains("compiler error"), "out: {out}");
+    assert!(out.contains("error found"), "out: {out}");
     assert!(out.contains("E0308"), "out: {out}");
 
     std::fs::remove_dir_all(&project).ok();
@@ -93,7 +93,7 @@ fn explain_uses_external_project_source() {
     write_project(&project, MISMATCHED);
 
     let arg = project.to_str().unwrap();
-    let output = run(&["explain", arg], &project);
+    let output = run(&[arg], &project);
 
     assert!(output.status.success());
 
@@ -118,7 +118,7 @@ fn explain_json_is_valid_json_without_extra_stdout() {
     write_project(&project, MISMATCHED);
 
     let arg = project.to_str().unwrap();
-    let output = run(&["explain", "--json", arg], &project);
+    let output = run(&["--json", arg], &project);
 
     assert!(output.status.success());
 
@@ -145,12 +145,12 @@ fn fix_dry_run_detects_fixes_without_modifying_external_project() {
     let before = std::fs::read_to_string(&main_rs).unwrap();
 
     let arg = project.to_str().unwrap();
-    let output = run(&["fix", "--dry-run", arg], &project);
+    let output = run(&["--fix", "--dry-run", arg], &project);
 
     assert!(output.status.success());
 
     let out = stdout(&output);
-    assert!(out.contains("safe fix"), "out: {out}");
+    assert!(out.contains("candidate repair"), "out: {out}");
     assert!(out.contains("Dry run"), "out: {out}");
 
     let after = std::fs::read_to_string(&main_rs).unwrap();
@@ -169,15 +169,14 @@ fn fix_applies_to_external_project_and_verifies() {
     let engine_before = std::fs::read_to_string(&engine_main_rs).unwrap();
 
     let arg = project.to_str().unwrap();
-    let output = run(&["fix", arg], &project);
+    let output = run(&["--fix", arg], &project);
 
     assert!(output.status.success());
 
     let out = stdout(&output);
-    assert!(out.contains("Fixes applied successfully"), "out: {out}");
     assert!(
-        out.contains("Project now compiles successfully"),
-        "post-fix cargo check must run: {out}"
+        out.contains("Verified repair"),
+        "a candidate must be verified by cargo check before it is applied: {out}"
     );
 
     let after = std::fs::read_to_string(&main_rs).unwrap();
@@ -191,6 +190,81 @@ fn fix_applies_to_external_project_and_verifies() {
         engine_before, engine_after,
         "engine repository must not be modified"
     );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn fix_json_reports_verification_after_isolated_oracle() {
+    let project = temp_dir("fix_json_verify");
+    write_project(&project, MUTABLE);
+
+    let arg = project.to_str().unwrap();
+    let output = run(&["--fix", "--json", arg], &project);
+
+    assert!(output.status.success());
+
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("stdout must be pure JSON");
+
+    assert_eq!(value["status"], "repair_applied");
+    assert_eq!(value["attempts"], 1);
+
+    let verification = &value["verification"];
+    assert_eq!(
+        verification["passed"], true,
+        "oracle must confirm the repair"
+    );
+    assert_eq!(verification["mode"], "check");
+    assert!(
+        verification["duration_ms"].as_u64().unwrap() > 0,
+        "isolation timing must be reported"
+    );
+
+    let applied = verification["applied"].as_array().unwrap();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0]["kind"], "compiler_suggested");
+    assert!(!applied[0]["patch"].as_array().unwrap().is_empty());
+
+    let after = std::fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(after.contains("let mut x = 1;"));
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn fix_verify_test_mode_uses_cargo_test_as_oracle() {
+    let project = temp_dir("fix_verify_test");
+    write_project(&project, MUTABLE);
+
+    let arg = project.to_str().unwrap();
+    let output = run(&["--fix", "--verify", "test", arg], &project);
+
+    assert!(output.status.success());
+
+    let out = stdout(&output);
+    assert!(
+        out.contains("`cargo test` passed"),
+        "oracle must be cargo test: {out}"
+    );
+
+    let after = std::fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(after.contains("let mut x = 1;"));
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn fix_rejects_unknown_verify_mode() {
+    let project = temp_dir("fix_verify_bad");
+    write_project(&project, MUTABLE);
+
+    let arg = project.to_str().unwrap();
+    let output = run(&["--fix", "--verify", "lint", arg], &project);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid --verify mode"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lint"));
 
     std::fs::remove_dir_all(&project).ok();
 }

@@ -140,6 +140,17 @@ fn extract_type_after(text: &str, prefix: &str) -> Option<String> {
     let start = text.find(prefix)?;
     let remaining = &text[start + prefix.len()..];
 
+    let immediate = remaining.trim_start();
+
+    if let Some(after) = immediate.strip_prefix('`')
+        && let Some(type_end) = after.find('`')
+    {
+        let value = after[..type_end].trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
     let segment = remaining.split(',').next().unwrap_or(remaining).trim();
 
     if let Some(type_start) = segment.find('`') {

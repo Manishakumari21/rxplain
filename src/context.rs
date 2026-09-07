@@ -51,13 +51,13 @@ impl SourceContext {
             return None;
         }
 
-        let line = span.line_start.max(1);
-
         let context_radius = 2;
 
-        let start_line = line.saturating_sub(context_radius).max(1);
+        let span_end_line = span.line_end.max(span.line_start);
 
-        let end_line = (line + context_radius).min(source_lines.len() as u32);
+        let start_line = (span.line_start.saturating_sub(context_radius)).max(1);
+
+        let end_line = (span_end_line + context_radius).min(source_lines.len() as u32);
 
         let mut lines = Vec::new();
 
